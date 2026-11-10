@@ -1,32 +1,33 @@
-# Training a 405B model
+# 训练 405B 模型
 
-**NOTE: This chapter's code builds off of [chapter 4's FSDP code](../04-fully-sharded-data-parallel/).**
+**注意：本章代码基于[第 4 章的 FSDP 代码](../04-fully-sharded-data-parallel/)。**
 
-Here we are going to utilize an 8 node cluster (64 H100 GPUs) to train Llama 3.1 405B. **This does not utilize LORA!** We are actually fully training the weights of a 405b model in plain pytorch.
+这里使用一个 8 节点集群（64 张 H100 GPU）训练 Llama 3.1 405B。**这里不使用 LoRA！** 我们确实是在普通 PyTorch 中完整训练一个 405B 模型的权重。
 
-The next few sections go through various changes we have to make to our FSDP code from chapter 4 to make training a 405b model work.
+接下来几节说明，为了训练 405B 模型，需要对第 4 章 FSDP 代码做哪些修改。
 
-Quick Jump:
-- [Use flash attention](#use-flash-attention)
-- [Download model weights](#download-model-weights)
-- [Loading pretrained weights](#loading-pretrained-weights)
-- [Sharding Llama 405B](#sharding-llama-405b)
-- [Gradient (aka activation) checkpointing](#gradient-aka-activation-checkpointing)
-- [CPU Offload \& fused optimizer kernels](#cpu-offload--fused-optimizer-kernels)
-- [NOT de-allocating gradients](#not-de-allocating-gradients)
-- [Launch command](#launch-command)
-- [Monitoring](#monitoring)
-- [Run statistics](#run-statistics)
+快速跳转：
 
-## Use flash attention
+- [使用 Flash Attention](#use-flash-attention)
+- [下载模型权重](#download-model-weights)
+- [加载预训练权重](#loading-pretrained-weights)
+- [给 Llama 405B 分片](#sharding-llama-405b)
+- [梯度（也就是激活）检查点](#gradient-aka-activation-checkpointing)
+- [CPU 卸载与融合优化器内核](#cpu-offload--fused-optimizer-kernels)
+- [不要释放梯度](#not-de-allocating-gradients)
+- [启动命令](#launch-command)
+- [监控](#monitoring)
+- [运行统计](#run-statistics)
 
-Flash attention is a fused implementation of scaled dot product attention that heavily minimizes memory usage. The whole goal behind it is to query memory as little as possible, and minimize temporary memory used.
+## 使用 Flash Attention
 
-Check out the [repo](https://github.com/Dao-AILab/flash-attention) and the [paper](https://arxiv.org/abs/2205.14135) for more information.
+Flash Attention 是缩放点积注意力的融合实现，能大幅降低显存占用。它的核心目标是尽量少访问内存，并减少临时内存。
 
-This ends up saving us 10s of gb in the forward/backward pass.
+更多信息见[代码仓库](https://github.com/Dao-AILab/flash-attention)和[论文](https://arxiv.org/abs/2205.14135)。
 
-Install:
+它最终能在前向和反向中节省数十 GB 显存。
+
+安装：
 
 ```bash
 pip install packaging
@@ -34,7 +35,7 @@ pip install ninja
 pip install flash-attn --no-build-isolation
 ```
 
-Use it when we initialize our model:
+初始化模型时启用它：
 
 ```python
 model = AutoModelForCausalLM.from_pretrained(
@@ -43,38 +44,38 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 ```
 
-## Download model weights
+## 下载模型权重
 
-The actual model weights are huge - it contains 191 separate files which are each about 4GB - totally about 764 GB.
+实际模型权重非常大：共有 191 个独立文件，每个约 4GB，总计约 764GB。
 
-There are two options for storing these weights here (and they make a difference!):
+存储这些权重有两种方式，而且差别很大：
 
-1. A shared network drive that all the nodes can access
-2. Locally on the main rank 0 node
+1. 所有节点都能访问的共享网络盘。
+2. 只放在主 rank 0 节点的本地存储。
 
-Node local storage is **much** faster when initializing. For some numbers, while running this script on 8 8xH100 80GB nodes, the shared network drive took 50 minutes to initialize, while the node local storage only took 3 minutes.
+初始化时，节点本地存储**快得多**。在 8 台 8×H100 80GB 节点上运行这个脚本时，共享网络盘初始化需要 50 分钟，节点本地存储只需要 3 分钟。
 
-There's a download script in this repo for utility, run this on node 0:
+仓库里提供了一个下载脚本。在节点 0 上运行：
 
 ```bash
 cd distributed-training-guide/05-training-llama-405b
 python download.py
 ```
 
-And run this on the other nodes (to download config & tokenizer):
+在其他节点上运行下面的命令，只下载配置和分词器：
 
 ```bash
 cd distributed-training-guide/05-training-llama-405b
 python download.py --skip-model
 ```
 
-NOTE: you will likely have to log into your huggingface account using `hf auth login`.
+注意：通常需要先用 `hf auth login` 登录 Hugging Face 账号。
 
-## Loading pretrained weights
+## 加载预训练权重
 
-### Load the model into CPU RAM
+### 把模型加载到 CPU 内存
 
-First we load the full model into CPU RAM on __rank 0__. We will use this later to broadcast all weights to all ranks. Note that we use `from_pretrained()`.
+首先在 **rank 0** 上把完整模型加载到 CPU 内存。稍后用它把所有权重广播给所有 rank。注意这里使用 `from_pretrained()`。
 
 ```python
 if rank == 0:
@@ -89,11 +90,11 @@ else:
 dist.barrier()
 ```
 
-When we actual load the weights, it will take some time AND takes a lot of memory to load. The full size is about 764 GB, so we need to make sure we have enough RAM to store the weights.
+真正加载权重时既耗时，也占用大量内存。完整大小约 764GB，因此必须确保有足够内存存放权重。
 
-### Initialize meta models on all ranks
+### 在所有 rank 上初始化 meta 模型
 
-For the actual models that we will be sharding we will initialize them with the `meta` model. This is for compatibility with the `set_model_state_dict()` api we will use shortly:
+对于即将分片的实际模型，使用 `meta` 设备初始化。这是为了兼容马上要用的 `set_model_state_dict()` API：
 
 ```python
 with rank0_first(), torch.device("meta"):
@@ -105,9 +106,9 @@ with rank0_first(), torch.device("meta"):
     )
 ```
 
-### Apply `fully_shard()`
+### 调用 `fully_shard()`
 
-Same thing we did last chapter. One slight difference here is we are setting `reshard_after_forward=False` on the top level model. Since that is the last layer to execute we can use the weights immediately during the backwards pass.
+做法与上一章相同。一个细微差别是，顶层模型设置 `reshard_after_forward=False`。因为它是最后执行的层，反向传播可以立即使用这些权重。
 
 ```python
 fsdp_config = dict(
@@ -122,9 +123,9 @@ model.to_empty(device="cpu" if args.cpu_offload else device)
 dist.barrier()
 ```
 
-### Broadcast weights from rank 0
+### 从 rank 0 广播权重
 
-[`set_model_state_dict()`](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.set_model_state_dict) will do the heavy lifting of broadcasting all of our weights (the `broadcast_from_rank0` means rank 0 will broadcast the `full_sd` to all ranks. remember that `full_sd` only exists on rank 0).
+[`set_model_state_dict()`](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.set_model_state_dict) 负责广播全部权重。`broadcast_from_rank0` 表示 rank 0 把 `full_sd` 广播给所有 rank。记住，`full_sd` 只存在于 rank 0。
 
 ```python
 set_model_state_dict(
@@ -138,7 +139,7 @@ set_model_state_dict(
 )
 ```
 
-Now unfortunately that's not quite all we need because of a little quirk of pytorch: buffers are not included in a model's state_dict()! That means things like RotaryEmbedding layers will not have the correct data because they don't exist in the state dict. So we have to manually do some extra work to broadcast the buffers from rank 0 as well:
+可惜这还不够，因为 PyTorch 有一个小特性：buffer 不包含在模型的 `state_dict()` 中。因此 RotaryEmbedding 等层不会得到正确数据，因为它们不在状态字典里。必须额外手动广播 rank 0 的 buffer：
 
 ```python
 if rank == 0:
@@ -152,23 +153,27 @@ else:
         buffer.copy_(device_buffer.to(buffer.device))
 ```
 
-And finally just to clean up our CPU RAM usage we can deallocate the `full_model` since we no longer need it:
+最后，为了清理 CPU 内存，可以释放不再需要的 `full_model`：
 
 ```python
 del full_sd
-# convienient way to force deallocation a model
+# 强制释放模型的简便方法
 if rank == 0:
     full_model.to(torch.device("meta"))
 del full_model
 ```
 
-## Gradient (aka activation) checkpointing
+## 给 Llama 405B 分片
 
-Another piece of reducing memory usage is gradient checkpointing (first introduced in [Training Deep Nets with Sublinear Memory Cost](https://arxiv.org/abs/1604.06174)). Normally when you do the forward pass, you have to keep the input & output in memory until you run the backward pass. This takes up a lot of memory to keep these intermediate tensors around. With gradient checkpointing, we actually **re-run** the forward pass during backwards to regenerate the output. So we are doing more compute but saving a lot of memory.
+上一节已经按解码器层调用了 `fully_shard()`。顶层模型使用 `reshard_after_forward=False`，解码器层使用 `reshard_after_forward=True`。
 
-The method we are using is kind of a hidden method in pytorch, but this is actually exactly what [accelerate uses under the hood](https://github.com/huggingface/accelerate/blob/v0.34.2/src/accelerate/accelerator.py#L1492) so rest assured that it is a "standard" way of doing it:
+## 梯度（也就是激活）检查点
 
-This piece of code has to go **after** the fully_shard bits!!! I'm not exactly sure of the reason, but it doesn't work before the FSDP initialization.
+降低显存占用的另一项技术是梯度检查点，最早见于 [Training Deep Nets with Sublinear Memory Cost](https://arxiv.org/abs/1604.06174)。正常前向时，必须把输入和输出保留到反向执行。保存这些中间张量会占用大量显存。使用梯度检查点后，反向期间会**重新执行**前向来再生输出。因此计算更多，但能节省大量显存。
+
+这里使用的是 PyTorch 中一个相对不显眼的方法，但它正是 [Accelerate 底层使用的方法](https://github.com/huggingface/accelerate/blob/v0.34.2/src/accelerate/accelerator.py#L1492)，因此可以认为这是一种「标准」做法。
+
+这段代码必须放在 `fully_shard` 相关代码**之后**。原因不完全明确，但放在 FSDP 初始化之前不会正常工作。
 
 ```python
 fully_shard(...)
@@ -188,23 +193,24 @@ apply_activation_checkpointing(
 )
 ```
 
-## CPU Offload & fused optimizer kernels
+## CPU 卸载与融合优化器内核
 
-Since the model is so large, we pretty much have to enable [CPU offloading](../04-fully-sharded-data-parallel/README.md#cpu-offload) with FSDP. **When using CPUOffload feature of FSDP, the optimizer entirely runs on the CPU**. This is because there is significant cost to transfer data to and from the GPU when doing `optimizer.step()`. At the time of this being written there are open issues on how to overlap the `optimizer.step()` with the next `forward()` call.
+模型非常大，因此基本上必须启用 FSDP 的 [CPU 卸载](../04-fully-sharded-data-parallel/README.md#cpu-offload)。**使用 FSDP 的 CPUOffload 功能时，优化器完全在 CPU 上运行。** 这是因为执行 `optimizer.step()` 时，在 GPU 和 CPU 之间传输数据的成本很高。撰写本文时，如何让 `optimizer.step()` 与下一次 `forward()` 重叠仍有未解决的问题。
 
-By default the optimizers will use non-fused kernel when running on the CPU which will generate a lot of intermediate tensors. By explicitly using the fused kernel we get a lot of speedup, which is especially important since we are running that step on the CPU:
+默认情况下，优化器在 CPU 上运行时使用非融合内核，会产生大量中间张量。显式使用融合内核可以获得很大加速；既然这一步运行在 CPU 上，这一点尤其重要：
 
 ```python
 torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
 ```
 
-If you want to peek through the pytorch code:
-1. [_single_tensor_adamw()](https://github.com/pytorch/pytorch/blob/v2.4.1/torch/optim/adamw.py#L322) is the default implementation used
-2. [_fused_adamw()](https://github.com/pytorch/pytorch/blob/v2.4.1/torch/optim/adamw.py#L612) is the fused implementation
+如果想查看 PyTorch 源码：
+
+1. [_single_tensor_adamw()](https://github.com/pytorch/pytorch/blob/v2.4.1/torch/optim/adamw.py#L322) 是默认实现。
+2. [_fused_adamw()](https://github.com/pytorch/pytorch/blob/v2.4.1/torch/optim/adamw.py#L612) 是融合实现。
 
 ## torch.compile
 
-This is an easy win for us to gain some throughput:
+这是一个容易获得吞吐量提升的改动：
 
 ```python
 model = torch.compile(model)
@@ -212,68 +218,67 @@ model.loss_function = torch.compile(model.loss_function)
 optimizer.step = torch.compile(optimizer.step)
 ```
 
-## NOT de-allocating gradients
+## 不要释放梯度
 
-You may have seen this `set_to_none` argument in [optimizer.zero_grad()](https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.zero_grad.html). According to the docs:
+你可能见过 [optimizer.zero_grad()](https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.zero_grad.html) 的 `set_to_none` 参数。文档说：
 
-> This will in general have lower memory footprint, and can modestly improve performance.
+> 这通常会降低内存占用，并可能适度提升性能。
 
-Basically `set_to_none=True` will **deallocate the gradients** after they are used. In most GPU cases where we want to save a bit of memory, it is a good thing to de-allocate. However in our case we are using CPU offload, which means all of our gradients are already on the CPU! Since we aren't taking up GPU memory, that means we just have to pay for allocating & de-allocating a lot if we do set to none. So if you set `set_to_none=False` you should actually see a slight speed up for our case!
+简单来说，`set_to_none=True` 会在梯度使用后**释放梯度**。在大多数想节省一点显存的 GPU 场景中，释放梯度是好事。但这里使用 CPU 卸载，所有梯度已经在 CPU 上。既然不占用 GPU 显存，设置 `set_to_none=True` 就只是反复付出分配和释放的成本。因此在这个场景中，把 `set_to_none=False` 反而会略微加速。
 
 ```python
 optimizer.zero_grad(set_to_none=not args.cpu_offload)
 ```
 
-## Launch command
+## 启动命令
 
-That's pretty much all the changes you need from our base [FSDP code](../04-fully-sharded-data-parallel/). Now let's launch!
+相对基础的 [FSDP 代码](../04-fully-sharded-data-parallel/)，需要的改动就是这些。现在启动训练。
 
-We provide a customized [launch.sh](./launch.sh) script here based on the bash command for spawning torchrun on all available nodes:
+这里提供了定制的 [launch.sh](./launch.sh)，它基于在所有可用节点上启动 `torchrun` 的 Bash 命令：
 
 ```bash
 cd distributed-training-guide/05-training-llama-405b
-bash launch.sh # NOTE: this is non blocking
+bash launch.sh # 注意：这条命令不会阻塞
 ```
 
-Also note that this launch.sh specifies `HF_HOME` as an environment variable in the tmux session, so if you've not used the default value of `/home/ubuntu/.cache/huggingface`, please update the script!
+另外，`launch.sh` 在 tmux 会话中把 `HF_HOME` 设为环境变量。如果没有使用默认值 `/home/ubuntu/.cache/huggingface`，请修改脚本。
 
-You can change the hostnames in the [hosts](./hosts) file in this directory.
+可以修改本目录 [hosts](./hosts) 文件中的主机名。
 
-## Monitoring
+## 监控
 
-We are using torchrun in our [launch.sh](./launch.sh) script, so we will get an output directory per node with a bunch of sub directories with our log files in them. It's a bit of a pain to manually monitor these, so here's a bash command for tailing all of them at once:
+[launch.sh](./launch.sh) 使用 `torchrun`，因此每个节点都会有一个输出目录，其中还有多个包含日志文件的子目录。逐个查看比较麻烦，可以用下面的 Bash 命令同时跟踪全部日志：
 
 ```bash
 cd distributed-training-guide/05-training-llama-405b
 find ../logs/ -name \*stderr.log | xargs tail -f
 ```
 
-Additionally, we have a top like utility script for monitoring the entire cluster at the top level of this directory:
+此外，仓库顶层有一个类似 `top` 的工具，用来监控整个集群：
 
 ```bash
 cd distributed-training-guide/05-training-llama-405b
 python ../top-cluster.py hosts
 ```
 
-If you notice any of the nprocs go down or the power usage go down then you know that an error has occurred!
+如果发现某个节点的进程数下降，或者功耗下降，就说明发生了错误。
 
-To kill all the processes on all the nodes you can just kill the tmux sessions:
+要停止所有节点上的进程，直接关闭 tmux 会话：
 
 ```bash
 xargs -a hosts -I{} ssh {} tmux kill-session -t torchrun-llama-405b
 ```
 
-## Run statistics
+## 运行统计
 
-Training with `--seq-length 4096` and `--batch-size 1` on 64 H100 gpus (8 separate nodes) has the following stats:
+在 64 张 H100 GPU（8 个独立节点）上，使用 `--seq-length 4096` 和 `--batch-size 1` 训练时，统计如下：
 
-- ~30s per iteration (data/forward/backward/update). Breakdown is
-  - data: ~2ms
-  - forward: ~7s
-  - backward: ~19s
-  - update: ~4s
-- Peak Memory Allocated: 52.9GB
-- Peak Memory Reserved: 77.9GB
+- 每次迭代（数据、前向、反向、更新）约 30 秒。细分是：
+  - data：约 2ms
+  - forward：约 7 秒
+  - backward：约 19 秒
+  - update：约 4 秒
+- 峰值已分配显存：52.9GB
+- 峰值预留显存：77.9GB
 
-**NOTE** these numbers were produced with pytorch 2.5.1 and an older version of the guide, so they may be out of date. 64xH100s are hard to find laying around 😄
-
+**注意：** 这些数字来自 PyTorch 2.5.1 和本指南的旧版本，因此可能已经过时。64 张 H100 也不容易随处找到 😄

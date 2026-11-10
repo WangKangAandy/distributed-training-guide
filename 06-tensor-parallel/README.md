@@ -1,40 +1,42 @@
-# Tensor Parallelism (TP)
+# 张量并行（Tensor Parallelism，TP）
 
-So far we've just been using data parallel techniques. You may have heard of other parallelism techniques, and indeed the [Llama 405B paper](https://ai.meta.com/research/publications/the-llama-3-herd-of-models/) actually uses 4D parallelism when training the 405B model:
+到目前为止，我们只用了数据并行技术。你可能还听过其他并行技术。实际上，[Llama 405B 论文](https://ai.meta.com/research/publications/the-llama-3-herd-of-models/)在训练 405B 模型时使用了 4D 并行：
 
-1. Data parallel (FSDP as we've learned)
-2. Tensor parallel (**this chapter**)
-3. Context parallel (For long context lengths)
-4. Pipeline/model parallel
+1. 数据并行（前面学过的 FSDP）
+2. 张量并行（**本章**）
+3. 上下文并行（用于长上下文）
+4. 流水线并行 / 模型并行
 
-In this chapter we are going to diving into what tensor parallelism is, before we think about combining it with other types.
+本章先深入了解张量并行是什么，然后再考虑把它和其他并行方式组合。
 
-## Basics: What is tensor parallelism?
+## 基础：什么是张量并行？
 
-TP splits the model weights **AND** computation across multiple GPUs.
+TP 把模型权重**和**计算都拆分到多张 GPU 上。
 
-FSDP splits the model weights, but it gathers them back for the computation. Splitting the computation across GPUs is the difference.
+FSDP 也会拆分模型权重，但计算前会把它们重新收集起来。是否把计算拆到多张 GPU，就是两者的区别。
 
-A result of this is the world size is scaled **down** by your tensor parallel size => the cost of allgathers/allreduces is reduced. This becomes a big factor when your cluster is large, and TP is a very effective way to scale up!
+结果是，world size 会按张量并行大小**缩小**，从而降低 all-gather 和 all-reduce 的成本。集群很大时，这会成为重要因素，TP 也是一种非常有效的扩展方式。
 
-Here are the benefits of this:
-1. The peak GPU memory is reduced - now instead of each GPU fully loading up the full weights for each layer, they now only load `1/num_gpus` of the weights.
-2. We now have `per GPU memory * num_gpus` as our amount of memory to use for each layer.
-3. Less allgather/allreduce cost
+优点：
 
-Here are the downsides:
-1. Global batch size is reduced
-2. Increased code complexity
+1. 峰值 GPU 显存降低。现在每张 GPU 不再为每一层加载完整权重，而只加载 `1/num_gpus` 的权重。
+2. 每一层可用的显存变成 `每张 GPU 的显存 × GPU 数量`。
+3. all-gather 和 all-reduce 的成本更低。
 
-Note that this can only really be applied to certain modules, but most of the modules in an LLM work with it.
+缺点：
 
-## Ensure all GPUs on a node get the same input
+1. 全局 batch size 变小。
+2. 代码复杂度增加。
 
-Since we are splitting computation across GPUs, all GPUs in the same group need to receive the same input. (That is why the global batch size is reduced).
+注意：它实际上只能应用于某些模块，但 LLM 中的大多数模块都适用。
 
-First we are going to create our device mesh. A device mesh is just a way to view your devices in an N-dimensional way. So if you have 8 GPUs, you could organize it into a device mesh like `(2, 2, 2)`, or `(2, 4)`, or `(4, 2)` or even things like `(1, 8)`.
+## 确保一个节点上的所有 GPU 收到相同输入
 
-The reason this is helpful is because we are going to name these dimensions, much like we do with tensor dimensions. Similar to how we have a batch and sequence dimension, for our device mesh we are going to have a data parallel and tensor parallel dimension.
+因为计算被拆分到多张 GPU，同一个组中的所有 GPU 都必须收到相同输入。这也是全局 batch size 变小的原因。
+
+首先创建 device mesh。device mesh 只是一种以 N 维方式查看设备的方法。如果有 8 张 GPU，可以组织成 `(2, 2, 2)`、`(2, 4)`、`(4, 2)`，甚至 `(1, 8)`。
+
+它有用的原因是，我们可以像给张量维度命名一样给这些维度命名。类似于 batch 维度和 sequence 维度，这里的 device mesh 会有数据并行维度和张量并行维度。
 
 ```python
 gpus_on_node = torch.cuda.device_count()
@@ -46,7 +48,7 @@ mesh = dist.device_mesh.init_device_mesh(
 )
 ```
 
-So if we have 4 GPUs total, and have a `(2, 2)` device mesh, here are the assignments:
+如果总共有 4 张 GPU，device mesh 是 `(2, 2)`，分配如下：
 
 | | DP rank | TP rank |
 | --- | --- | --- |
@@ -55,35 +57,34 @@ So if we have 4 GPUs total, and have a `(2, 2)` device mesh, here are the assign
 | GPU 2 | 1 | 0 |
 | GPU 3 | 1 | 1 |
 
-This doesn't actually mean anything unless we update the rest of our code to use these device meshes, so let's see how we do that!
-A lot of the pytorch distributed APIs actually take an optional `mesh: Optional[DeviceMesh] = None` argument, we just haven't used it so far.
+除非后续代码使用这些 device mesh，否则这个表本身没有任何作用。下面看看如何使用。很多 PyTorch 分布式 API 都接受可选参数 `mesh: Optional[DeviceMesh] = None`，只是前面还没有用过。
 
-The first place is actually our data sampler, and this is how we get all of our GPUs in the tensor parallel group the same input:
+第一处是数据 sampler。它让张量并行组中的所有 GPU 得到相同输入：
 
 ```python
 sampler=DistributedSampler(
     ...,
     num_replicas=mesh["dp"].size(),
-    # NOTE: every GPU on a node will have the same "dp" rank,
-    # meaning they will all receive the same input!
+    # NOTE: 一个节点上的每张 GPU 都有相同的 "dp" rank，
+    # 因此它们都会收到相同输入！
     rank=mesh["dp"].get_local_rank(),
 )
 ```
 
-From GPU 0's perspective above, it would have these arguments to DistributedSampler:
+从上表中 GPU 0 的视角看，传给 DistributedSampler 的参数是：
 
-| | num_replicas | rank|
+| | num_replicas | rank |
 | --- | --- | --- |
 | GPU 0 | 2 | 0 |
 | GPU 1 | 2 | 0 |
 | GPU 2 | 2 | 1 |
 | GPU 3 | 2 | 1 |
 
-Because our DP dimension is size of 2, and our first table above actually shows the local_rank that we use to pass to DistributedSampler.
+因为 DP 维度的大小是 2，而第一张表显示的正是传给 DistributedSampler 的 local rank。
 
-## Parallelizing linear & attention modules
+## 并行化线性层和注意力模块
 
-Here's the code first and then there are graphics after this that explain how this works. Note that we are passing our `mesh["tp"]` to the API, which means this is happening across our tensor parallel group!
+先看代码，后面的图会解释它如何工作。注意我们把 `mesh["tp"]` 传给 API，这意味着操作发生在张量并行组内。
 
 ```python
 for layer in model.model.layers:
@@ -103,42 +104,44 @@ for layer in model.model.layers:
     )
 ```
 
-### colwise
+### 按列切分（colwise）
 
-Our first three linear layers in self attention (q/k/v projection) are all colwise linear. This means we are sharding the weight matrix inside along dimension 0 (since it's stored in a transposed format). The remainder of the attention layer (including self attention), uses this sharded output to run (so attention actually will run on smaller tensors).
+自注意力中的前三个线性层（q/k/v 投影）都是按列切分的线性层。由于权重以转置格式存储，这表示沿维度 0 切分层内的权重矩阵。注意力层的其余部分（包括自注意力）使用这个已切分的输出运行，因此注意力实际运行在更小的张量上。
 
 <image src="https://storage.googleapis.com/lightning-avatars/litpages/01hyz8vg94nc6nk7t10rt8jpt1/a2fe38f3-4a73-4b0f-80da-c273d14cadd9.jpeg" width="640px" />
 
-Image Source: [PyTorchLightning](https://lightning.ai/lightning-ai/studios/tensor-parallelism-supercharging-large-model-training-with-pytorch-lightning#column-wise-parallel)
+图片来源：[PyTorchLightning](https://lightning.ai/lightning-ai/studios/tensor-parallelism-supercharging-large-model-training-with-pytorch-lightning#column-wise-parallel)
 
-### colwise into rowwise
+### 从按列切分进入按行切分
 
-Our final layer in our self attention layer is another linear layer (o_proj). Note that we are doing rowwise parallel here. This actually let's us "recombine" across our tp dimension, as shown here:
+自注意力的最后一层是另一个线性层（`o_proj`）。这里使用按行并行。如下图所示，它可以在 TP 维度上「重新合并」：
 
 <image src="https://storage.googleapis.com/lightning-avatars/litpages/01hyz8vg94nc6nk7t10rt8jpt1/a1bc6e8a-7146-44c6-b6cf-eec124cfbf74.jpeg" width="640px" />
 
-Image Source: [PyTorchLightning](https://lightning.ai/lightning-ai/studios/tensor-parallelism-supercharging-large-model-training-with-pytorch-lightning#combined-parallel-layers)
+图片来源：[PyTorchLightning](https://lightning.ai/lightning-ai/studios/tensor-parallelism-supercharging-large-model-training-with-pytorch-lightning#combined-parallel-layers)
 
-So the final output of self attention will be replicated again.
+因此，自注意力的最终输出会再次成为副本。
 
-### Parallelizing Embedding layer
+### 并行化 Embedding 层
 
-The embeddings weight get's sharded along dimension 1. Meaning each GPU holds a different slice of the data associated with each token:
+Embedding 权重沿维度 1 切分。也就是说，每张 GPU 保存每个 token 对应数据的不同切片：
 
-| Embedding Weight Shape | Sharded Shape |
+| Embedding 权重形状 | 切分后的形状 |
 | --- | --- |
 | `(vocab_size, hidden_dim)` | `(vocab_size, hidden_dim / mesh["tp"].size())` |
 
-In a normal embedding layer it:
-- Takes input tokens of `shape=(batch, seq)`
-- Outputs embeddings of `shape=(batch, seq, hidden_dim)`
+普通 Embedding 层：
 
-Now that we've sharded the embedding weight tensor, the layer will actually output:
-- Sharded output embeddings of `shape=(batch, seq, hidden_dim / mesh["tp"].size())`.
+- 输入 token 的形状是 `shape=(batch, seq)`。
+- 输出 embedding 的形状是 `shape=(batch, seq, hidden_dim)`。
 
-We have a problem though: Our *colwise* pieces of the `self_attn` module will receive the output of this module. ColwiseParallel actually expects input to be **replicated** not sharded.
+切分 Embedding 权重张量后，这一层实际输出：
 
-So we need to do an allgather on the tensor to replicate it across the group (i.e. it will be back to `shape=(batch, seq, hidden_dim)`). Luckily we can just specify this additional transformation with the `output_layouts` argument:
+- 已切分的 embedding，形状是 `shape=(batch, seq, hidden_dim / mesh["tp"].size())`。
+
+但这里有一个问题：`self_attn` 模块中的 **colwise** 部分会接收这一层的输出。ColwiseParallel 期望输入是**复制的**，而不是切分的。
+
+因此需要对张量做一次 all-gather，让它在组内重新复制，也就是恢复为 `shape=(batch, seq, hidden_dim)`。幸好可以通过 `output_layouts` 参数指定这个额外变换：
 
 ```python
 tp.parallelize_module(
@@ -148,7 +151,7 @@ tp.parallelize_module(
 )
 ```
 
-### Parallelizing the final linear layer of the model
+### 并行化模型最后的线性层
 
 ```python
 tp.parallelize_module(
@@ -162,13 +165,13 @@ tp.parallelize_module(
 )
 ```
 
-We have to include `Replicate()` here because our loss expects replicated tensors, but colwise by default shards on the last dimension.
+这里必须包含 `Replicate()`，因为 loss 期望接收复制后的张量，而 colwise 默认会在最后一个维度上切分。
 
-## Parallelizing Norm Layers with SequenceParallel
+## 用 SequenceParallel 并行化 Norm 层
 
-For normalization layers, it works a bit differently. We don't actually shard the layer's weights at all, instead, we shard the **input** for this on the sequence dimension!
+归一化层的工作方式略有不同。我们完全不切分层的权重，而是沿序列维度切分它的**输入**。
 
-So our computation is split, and we need to do some work to join the results back together for the other modules:
+因此计算被拆开了，还需要做一些工作，把结果重新拼合给其他模块：
 
 ```diff
  for layer in model.model.layers:
@@ -199,9 +202,9 @@ So our computation is split, and we need to do some work to join the results bac
      )
 ```
 
-The `PrepareModuleInput` objects transform how the tensors are split up. E.g. for `self_attn` the hidden_states input is sharded along the 1st dimension because of the `SequenceParallel`, but all the `ColwiseParallel` expect input to be replicated.
+`PrepareModuleInput` 对象改变张量的切分方式。例如，对 `self_attn` 来说，`hidden_states` 输入因为 `SequenceParallel` 而沿第 1 维切分，但所有 `ColwiseParallel` 都期望输入是复制的。
 
-We also need to change our embedding layer, since now the output of that is going into our SequenceParallel layer, we need to shard it along dimension 1:
+Embedding 层也要修改。现在它的输出进入 SequenceParallel 层，因此需要沿维度 1 切分：
 
 ```diff
  tp.parallelize_module(
@@ -212,7 +215,7 @@ We also need to change our embedding layer, since now the output of that is goin
  )
 ```
 
-We actually need an additional change because of this, due to `transformers` specific code. It computes the sequence length based on the output of the embedding layer, which will be wrong since we are now sharding it along the sequence dimension. Passing position_ids explicitly will fix this, but **its very implementation specific**:
+由于 `transformers` 的特定代码，还需要一项额外修改。它根据 Embedding 层的输出计算序列长度；现在沿序列维度切分后，这个长度会是错的。显式传入 `position_ids` 可以修复，但**这非常依赖具体实现**：
 
 ```diff
  with timers["data"], torch.no_grad():
@@ -223,7 +226,8 @@ We actually need an additional change because of this, due to `transformers` spe
 +    ).unsqueeze(0)
 ```
 
-And here is the diff for our final output from the network:
+网络最终输出的差异如下：
+
 ```diff
  tp.parallelize_module(
      model,
@@ -238,9 +242,9 @@ And here is the diff for our final output from the network:
  )
 ```
 
-## Parallelizing Loss computation
+## 并行化 loss 计算
 
-There's an additional api for parallelizing the loss computation (only works for Cross Entropy at the moment of writing) across the **class** dimension. We first need to use this context manager around our loss computation:
+还有一个 API 可以沿**类别**维度并行化 loss 计算（撰写时只支持交叉熵）。首先要在 loss 计算周围使用这个上下文管理器：
 
 ```python
 with tp.loss_parallel(), timers["forward"]:
@@ -250,7 +254,7 @@ with tp.loss_parallel(), timers["backward"]:
     outputs.loss.backward()
 ```
 
-Then we need to update the output of our `lm_head` for this also, because loss_parallel requires different sharding format and DTensor:
+然后还要更新 `lm_head` 的输出，因为 `loss_parallel` 需要不同的切分格式和 DTensor：
 
 ```diff
  tp.parallelize_module(
@@ -268,11 +272,11 @@ Then we need to update the output of our `lm_head` for this also, because loss_p
  )
 ```
 
-`use_local_output=False` tells pytorch to return a `DTensor` from the operation, instead of a normal `Tensor`.
+`use_local_output=False` 告诉 PyTorch，该操作返回 `DTensor`，而不是普通 `Tensor`。
 
-## Computing throughput with our new world size
+## 用新的 world size 计算吞吐量
 
-Because each of our GPUs is now no longer the unit, we just need to update our throughput calculation to use our device mesh:
+现在单张 GPU 不再是计算单位，因此吞吐量计算要改用 device mesh：
 
 ```diff
  if state["global_step"] % args.log_freq == 0:
@@ -281,11 +285,12 @@ Because each of our GPUs is now no longer the unit, we just need to update our t
      ms_per_step = sum(t.avg_elapsed_ms() for t in timers.values())
 ```
 
-## Results
+## 结果
 
-Here are some results from launching training for llama 8B on a single node of 8x H100s:
+下面是在单台 8×H100 节点上启动 Llama 8B 训练的结果。
 
-Command:
+命令：
+
 ```bash
 HF_HOME=/home/ubuntu/.cache/huggingface OMP_NUM_THREADS=26 torchrun --standalone --nproc-per-node gpu train_llm.py --experiment-name tp-llama-8b --dataset-name tatsu-lab/alpaca --model-name meta-llama/Llama-3.1-8B --log-freq 10 --batch-size 16 --seq-length 1024 --num-epochs 1
 ```
@@ -294,29 +299,30 @@ HF_HOME=/home/ubuntu/.cache/huggingface OMP_NUM_THREADS=26 torchrun --standalone
 
 <img src="https://github.com/user-attachments/assets/c6e67666-db7c-4b67-bae4-98480382557f" width="480px" />
 
-## Useful References
+## 有用的参考资料
 
-For completeness here are the relevant docs/guides from pytorch on how to achieve this:
-- [TP API docs](https://pytorch.org/docs/stable/distributed.tensor.parallel.html#tensor-parallelism-torch-distributed-tensor-parallel)
-- [2d Parallelism Tutorial](https://pytorch.org/tutorials/intermediate/TP_tutorial.html#large-scale-transformer-model-training-with-tensor-parallel-tp)
-- [Device Mesh tutorial](https://pytorch.org/tutorials/recipes/distributed_device_mesh.html)
-- [PyTorch Lightning TP Tutorial](https://lightning.ai/lightning-ai/studios/tensor-parallelism-supercharging-large-model-training-with-pytorch-lightning)
+为了完整起见，这里列出 PyTorch 中实现这些功能的相关文档和指南：
 
-## Pytorch API Reference
+- [TP API 文档](https://pytorch.org/docs/stable/distributed.tensor.parallel.html#tensor-parallelism-torch-distributed-tensor-parallel)
+- [2D 并行教程](https://pytorch.org/tutorials/intermediate/TP_tutorial.html#large-scale-transformer-model-training-with-tensor-parallel-tp)
+- [Device Mesh 教程](https://pytorch.org/tutorials/recipes/distributed_device_mesh.html)
+- [PyTorch Lightning TP 教程](https://lightning.ai/lightning-ai/studios/tensor-parallelism-supercharging-large-model-training-with-pytorch-lightning)
 
-Here we are going to give a brief explanation of how the api we are going to be using works.
+## PyTorch API 参考
 
-- [tp.RowwiseParallel()](https://pytorch.org/docs/stable/distributed.tensor.parallel.html#torch.distributed.tensor.parallel.RowwiseParallel) shards the module's weights in a row wise fashion.
-    - Inputs by default are sharded on last dimension
-    - Outputs by default are replicated on all workers
-- [tp.ColwiseParallel()](https://pytorch.org/docs/stable/distributed.tensor.parallel.html#torch.distributed.tensor.parallel.ColwiseParallel) shards the module's weights in a col wise fashion.
-    - Inputs by default are replicated on all workers
-    - Outputs by default are sharded on last dimension
-- [tp.SequenceParallel()](https://pytorch.org/docs/stable/distributed.tensor.parallel.html#torch.distributed.tensor.parallel.SequenceParallel) shards the input/output across dimension 1. Module weights are NOT sharded.
-- [tp.PrepareModuleInput()](https://pytorch.org/docs/stable/distributed.tensor.parallel.html#torch.distributed.tensor.parallel.PrepareModuleInput) let's you change the sharding configuration of input tensors
-- `torch.distributed._tensor.Shard(dim=X)` indicates a tensor should be sharded along dimension X
-- `torch.distributed._tensor.Replicate()` indicates a tensor should be replicated among all workers.
+这里简要说明即将使用的 API 如何工作。
 
-How all of these things interact is actually very subtle and complex, which is why this guide is useful!
+- [tp.RowwiseParallel()](https://pytorch.org/docs/stable/distributed.tensor.parallel.html#torch.distributed.tensor.parallel.RowwiseParallel) 按行切分模块权重。
+    - 输入默认沿最后一个维度切分。
+    - 输出默认在所有 worker 上复制。
+- [tp.ColwiseParallel()](https://pytorch.org/docs/stable/distributed.tensor.parallel.html#torch.distributed.tensor.parallel.ColwiseParallel) 按列切分模块权重。
+    - 输入默认在所有 worker 上复制。
+    - 输出默认沿最后一个维度切分。
+- [tp.SequenceParallel()](https://pytorch.org/docs/stable/distributed.tensor.parallel.html#torch.distributed.tensor.parallel.SequenceParallel) 沿维度 1 切分输入和输出。模块权重**不会**被切分。
+- [tp.PrepareModuleInput()](https://pytorch.org/docs/stable/distributed.tensor.parallel.html#torch.distributed.tensor.parallel.PrepareModuleInput) 用于改变输入张量的切分配置。
+- `torch.distributed._tensor.Shard(dim=X)` 表示张量应沿维度 X 切分。
+- `torch.distributed._tensor.Replicate()` 表示张量应在所有 worker 上复制。
 
-You can also change most of the default behavior with arguments to these classes. For example, you can change RowwiseParallel to assume the input is replicated instead of sharded.
+这些对象之间的交互实际上非常微妙和复杂，这也是本指南有用的原因。
+
+还可以通过这些类的参数改变大多数默认行为。例如，可以让 RowwiseParallel 假设输入是复制的，而不是切分的。
