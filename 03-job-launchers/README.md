@@ -2,6 +2,8 @@
 
 **注意：本章代码与[第 2 章](../02-distributed-data-parallel/)完全相同，因此命令使用第 2 章的训练脚本。** 如果某种启动器必须修改代码才能工作，文中会单独标出。
 
+> 译注：本章 MPI 和 DeepSpeed 小节要求的代码改动，应分别应用到第 2 章脚本或它的副本，再运行对应命令；以下路径修正并不表示未经修改的脚本支持所有启动器。
+
 手动 SSH 到每台节点再启动训练很麻烦，所以有多种方法可以从一台节点启动分布式训练任务。
 
 快速跳转：
@@ -149,7 +151,7 @@ mpirun \
     -map-by slot \
     -wdir $(pwd) \
     -output-filename ../logs/mpi-multi-node \
-    $(which python) train_llm.py \
+    $(which python) ../02-distributed-data-parallel/train_llm.py \
     --experiment-name mpi-multi-node \
     --dataset-name tatsu-lab/alpaca \
     --model-name openai-community/gpt2
@@ -205,7 +207,7 @@ export OMP_NUM_THREADS=1
 deepspeed \
     --include <ip of node 1>@<ip of node 2> \
     --enable_each_rank_log ../logs \
-    train_llm.py \
+    ../02-distributed-data-parallel/train_llm.py \
     --experiment-name deepspeed-multi-node \
     --dataset-name tatsu-lab/alpaca \
     --model-name openai-community/gpt2

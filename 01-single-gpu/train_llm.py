@@ -217,16 +217,16 @@ def _load_and_preprocess_data(args, config):
     if seq_length > config.max_position_embeddings:
         seq_length = min(1024, config.max_position_embeddings)
 
-    # 主要的数据处理函数：拼接数据集中的全部文本，并生成长度为 block_size 的块。
+    # 主要的数据处理函数：拼接数据集中的全部文本，并按 seq_length 切分文本块。
     def group_texts(examples):
         # 拼接全部文本。
         concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
         total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # 丢弃不足一个块的剩余部分。如果 total_length < block_size，就排除这个 batch 并返回空字典。
+        # 总长度超过 seq_length 时，截去不足整块的尾部；正长度不足一块时，当前实现仍保留短块。
         # 如果模型支持填充，也可以改成填充，而不是丢弃；这部分可以按需要自定义。
         if total_length > seq_length:
             total_length = (total_length // seq_length) * seq_length
-        # 按 max_len 切成块。
+        # 按 seq_length 切成块。
         result = {
             k: [t[i : i + seq_length] for i in range(0, total_length, seq_length)]
             for k, t in concatenated_examples.items()
