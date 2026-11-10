@@ -139,7 +139,9 @@ set_model_state_dict(
 )
 ```
 
-可惜这还不够，因为 PyTorch 有一个小特性：buffer 不包含在模型的 `state_dict()` 中。因此 RotaryEmbedding 等层不会得到正确数据，因为它们不在状态字典里。必须额外手动广播 rank 0 的 buffer：
+这还不够：RotaryEmbedding 中的非持久化 buffer 不会随 `state_dict()` 一起加载，需要额外初始化或从 rank 0 广播。这里手动广播 buffer：
+
+> 译注：原文笼统地说所有 buffer 都不在 `state_dict()` 中，实际只有非持久化（`persistent=False`）等未保存项不在其中；持久化 buffer 会随参数保存。参见 [PyTorch Module 文档](https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.register_buffer)。
 
 ```python
 if rank == 0:
@@ -251,7 +253,7 @@ bash launch.sh # 注意：这条命令不会阻塞
 
 ```bash
 cd distributed-training-guide/05-training-llama-405b
-find ../logs/ -name \*stderr.log | xargs tail -f
+find ./logs/ -name \*stderr.log | xargs tail -f
 ```
 
 此外，仓库顶层有一个类似 `top` 的工具，用来监控整个集群：

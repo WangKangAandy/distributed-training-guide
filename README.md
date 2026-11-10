@@ -1,5 +1,9 @@
 # 分布式训练指南
 
+本分支提供完整简体中文阅读版，覆盖全部教程、相关主题及示例脚本的教学注释。英文原版见 [LambdaLabsML/distributed-training-guide](https://github.com/LambdaLabsML/distributed-training-guide)，翻译基于上游 `aed7489`。正文中的“译注”用于澄清原文或说明示例边界。
+
+API、配置键、命令参数、论文名称和日志输出保留原文，便于检索和排障。[LICENSE](./LICENSE) 保留 MIT 许可证原文。教程命令以 Linux/Bash 和相应的 GPU/集群环境为基础。
+
 🔥 新消息 🔥
 
 - [PyTorch Conference 2025 幻灯片](https://docs.google.com/presentation/d/126BQcCJti_z3NQ7cGbm2iMBDVG7-0ekitxU3pvJ_WQw/edit?usp=sharing)

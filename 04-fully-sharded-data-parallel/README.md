@@ -10,7 +10,9 @@
 
 这意味着：
 
-1. 模型的每一层在执行前，仍需要把该层**完整**的参数、梯度和优化器状态取到 GPU 显存中。层执行完后再重新分片。
+1. FSDP 单元执行前，需要通过 all-gather 收集该单元的**完整参数**；计算后按配置重新分片。反向传播通过 reduce-scatter 归约并分片梯度，优化器使用本地参数分片及对应状态更新。
+
+   > 译注：原文把梯度和优化器状态也列为每层需要完整收集的对象，这不符合 [FSDP2 的工作方式](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html)。启用 CPU offload 时，优化器更新在 CPU 上执行。
 2. 每层前后的取消分片和重新分片都有同步成本。
 3. 分片不会降低最大一层的峰值显存占用。
 
@@ -92,7 +94,9 @@ fully_shard(model, **fsdp_config)
 
 > 反向传播时，分片梯度会从设备复制到主机，并且 **`optimizer.step()` 在 CPU 上运行**，使用的是 CPU 上的优化器状态。
 
-注意：这个选项**不会降低峰值 GPU 显存需求**。每一层仍会完整地在 GPU 上执行。但由于更多内容存放在 CPU 上，每一层可能有更多可用显存。
+注意：CPU offload **不会消除单个 FSDP 单元计算时完整参数和中间激活的显存需求**。不过，常驻 GPU 的分片状态减少后，总峰值显存仍可能下降。
+
+> 译注：原文“不会降低峰值 GPU 显存”的说法过于绝对；这里区分单层计算所需显存与整个训练过程的总峰值。
 
 ### 初始化模型
 
@@ -212,7 +216,7 @@ https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html#formats
 命令与平常相同：
 
 ```bash
-cd distributed-training-guide/04-sharding-fsdp
+cd distributed-training-guide/04-fully-sharded-data-parallel
 export TORCHELASTIC_ERROR_FILE=../error.json
 export OMP_NUM_THREADS=1
 export HF_HOME=../.cache

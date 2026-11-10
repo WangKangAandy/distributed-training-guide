@@ -81,3 +81,5 @@ index 24eacbd..0a3a029 100644
      data = datasets.load_dataset(
          args.dataset_name, trust_remote_code=True, 
 ```
+
+> 译注：上面的 diff 保留了原文历史目录名，用于说明改动，不可直接当作针对当前目录的补丁应用。严格恢复训练还需保存各 rank 自己的 RNG 状态及数据迭代进度；只保存 rank 0 的状态，不能保证所有分布式任务在重启后精确复现。

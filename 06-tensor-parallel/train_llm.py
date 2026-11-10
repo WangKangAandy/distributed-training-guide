@@ -143,7 +143,7 @@ def main():
             shuffle=True,
             drop_last=True,
             num_replicas=mesh["dp"].size(),  # 等价于 `num_nodes`
-            rank=mesh["dp"].get_local_rank(),  # 等价于 `rank // num_nodes`
+            rank=mesh["dp"].get_local_rank(),  # 当前 mesh 布局下等价于 `rank // gpus_on_node`。
         ),
     )
     LOGGER.debug(f"{len(dataloader)} batches per epoch")

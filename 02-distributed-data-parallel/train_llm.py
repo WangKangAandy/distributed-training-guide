@@ -148,7 +148,7 @@ def main():
 
             with timers["forward"]:
                 outputs = model(**batch)
-                del batch  # NOTE: to save memory for backwards pass
+                del batch  # 注意：为反向传播腾出显存。
 
             with timers["backward"]:
                 outputs.loss.backward()

@@ -2,7 +2,7 @@
 
 弹性训练是指启动器可以在训练过程中的不同时刻重启一部分（或全部）worker。
 
-与你可能的预期相反，通常只要 1 个 worker 遇到错误，**所有 worker 都会重启**（见 https://pytorch.org/docs/stable/elastic/run.html#membership-changes）。
+与你可能的预期相反，通常只要 1 个 worker 遇到错误，**所有 worker 都会重启**（见[成员变化说明](https://pytorch.org/docs/stable/elastic/run.html#membership-changes)）。
 
 `torchrun` 通过[弹性启动](https://pytorch.org/docs/stable/elastic/run.html#elastic-min-1-max-4-tolerates-up-to-3-membership-changes-or-failures)支持这一点：
 
@@ -25,7 +25,7 @@ torchrun
 现有代码做弹性训练不需要修改。更有帮助的是运行一个 worker 随机崩溃的示例，感受它如何工作。
 
 ```bash
-cd distributed-training-guide/96-elastic-training
+cd distributed-training-guide/related-topics/elastic-training
 torchrun \
     --nnodes 1 \
     --nproc_per_node 8 \

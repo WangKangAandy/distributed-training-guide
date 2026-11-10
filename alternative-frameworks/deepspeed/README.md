@@ -172,7 +172,7 @@
 ## 命令
 
 ```bash
-cd distributed-training-guide/05-sharding-deepspeed
+cd distributed-training-guide/alternative-frameworks/deepspeed
 export TORCHELASTIC_ERROR_FILE=../error.json
 export OMP_NUM_THREADS=1
 export HF_HOME=../.cache

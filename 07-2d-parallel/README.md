@@ -63,3 +63,5 @@ parser.add_argument("--tp", default=8, type=int)
 <img src="https://github.com/user-attachments/assets/8645b7d2-992f-4f49-9214-f6c5d4d42c37" width="480px" />
 
 <img src="https://github.com/user-attachments/assets/1b9269ce-c1db-43e4-9fd7-0bbf11871b11" width="480px" />
+
+> 译注：上述配置按 `DP大小 × TP大小` 记，例如 2×4 表示每个 DP/FSDP 通信组有 2 个 rank，每个 TP 组有 4 个 rank。原文的“2 组 FSDP”是指 DP 维度大小为 2；实际有 4 个各含 2 个 rank 的 FSDP 通信组。

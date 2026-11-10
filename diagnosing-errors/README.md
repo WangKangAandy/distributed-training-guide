@@ -20,6 +20,8 @@
 
 使用提供的 [top-cluster.py](../top-cluster.py) 脚本会输出类似下面的内容：
 
+从仓库根目录运行；`hosts` 文件每行填写一个主机名。可选参数 `--poll-freq` 控制轮询间隔，单位为毫秒，默认 `1000`。输出列 `util`、`power`、`memory`、`nprocs` 分别表示 GPU 利用率、功耗比例、显存占用比例和计算进程数。
+
 ```bash
 > python top-cluster.py <hosts file>
 ===2024-10-02 19:55:02.553039
@@ -72,3 +74,5 @@ def main():
 3. NVLink 状态：`nvidia-smi topo -p2p n`（也可以把 `n` 换成 `w` 或 `r`）。
 4. 打开文件描述符上限：`ulimit -aH`，然后查看包含 `open files` 的那一行。
 5. `dist.init_process_group(timeout=...)` 中的 `timeout` 足够大。
+
+> 译注：使用 `py-spy` 时应传入目标训练 worker 的 Python PID；只查看 `torchrun` 启动器的 PID 可能只能看到等待子进程的调用栈。`@record` 主要记录装饰入口中传播出的异常，不能保证捕获所有线程或 DataLoader 子进程中的任意错误；单卡示例也未使用该装饰器。功耗下降是排障线索，不是判断挂起的充分条件。

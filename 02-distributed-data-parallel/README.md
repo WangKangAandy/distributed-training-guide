@@ -58,19 +58,21 @@ GPU 上的分布式训练其实一样：我们把工作量（数据集中的 bat
 现在看训练循环。PyTorch 中典型写法是：
 
 ```python
-loss = model(**batch) # 1. 异步前向
-optimizer.zero_grad() # 2. 异步清空梯度
-loss.backward()       # 3. 异步计算梯度
-optimizer.step()      # 4. 同步梯度并更新权重
+outputs = model(**batch) # 1. 前向计算
+optimizer.zero_grad()    # 2. 清空梯度
+outputs.loss.backward()  # 3. 计算梯度，DDP hooks 触发梯度归约
+optimizer.step()         # 4. 各 rank 使用同步后的梯度更新权重
 ```
 
-前三行都可以异步完成。`loss.backward()` 会在每个训练进程里计算梯度。巧妙之处在于，`optimizer.step()` 会先在所有进程之间同步梯度，再真正更新模型参数。
+`backward()` 在各训练进程中计算梯度，DDP 通过 autograd hooks 发起梯度归约，并尽可能让通信与反向计算重叠。随后，各 rank 的 `optimizer.step()` 使用已同步的梯度在本地更新参数。
+
+> 译注：原文将梯度同步归因于 `optimizer.step()`，这里依据 [PyTorch DDP 设计说明](https://docs.pytorch.org/docs/stable/notes/ddp.html)予以纠正。示例也按本仓库 Transformers 模型的返回值使用 `outputs.loss`。
 
 下面是使用这种数据并行时，一个训练步骤的高层示意图：
 
 <img width="800" alt="image" src="https://github.com/user-attachments/assets/a988f513-a5b3-4e5f-bf0d-019e796ee4e0" />
 
-明确地说：**`optimizer.step()` 是所有进程的同步点**。
+明确地说：**默认 DDP 的梯度同步发生在反向传播过程中，而不是由 `optimizer.step()` 发起**。图中的同步应理解为发生在参数更新之前。
 
 PyTorch 如何实现这一点？
 
@@ -177,10 +179,10 @@ Launches subproc `$RANK=2 $WORLD_SIZE=3 train_llm.py ...`
 
 这个类还保证**构造时各进程的模型参数相同**。
 
-它通过一些[特殊的模型钩子](https://github.com/pytorch/pytorch/blob/v2.4.1/torch/nn/parallel/distributed.py#L939)，把所有 rank 的梯度在每个 rank 上相加：
+它通过一些[特殊的模型钩子](https://github.com/pytorch/pytorch/blob/v2.4.1/torch/nn/parallel/distributed.py#L939)，对所有 rank 的梯度进行归约；下面先除以进程数再求和，得到的是平均梯度：
 
 ```python
-# NOTE: internal pytorch code found at https://github.com/pytorch/pytorch/blob/v2.4.1/torch/nn/parallel/distributed.py#L939
+# 注意：以下为 PyTorch 内部代码，见 https://github.com/pytorch/pytorch/blob/v2.4.1/torch/nn/parallel/distributed.py#L939
 gradient = param.grad / self.process_group.size()
 gradient = fcol.all_reduce(gradient, "sum", self.process_group)
 ```

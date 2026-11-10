@@ -40,7 +40,7 @@ if local_rank == 0:
 如果希望名称显示为节点编号，可以设置：
 
 ```python
-name=f"node-{rank // world_size}"
+name=f"node-{rank // torch.cuda.device_count()}"
 ```
 
 ## 每个 rank
@@ -61,3 +61,5 @@ wandb.init(
     config=...,
 )
 ```
+
+> 译注：原文用 `rank // world_size` 计算节点编号，结果始终为 0。上例改为除以每节点 GPU 数，假设各节点 GPU 数相同、每 GPU 一个进程且全局 rank 按节点连续分配。异构布局应使用启动器提供的节点标识。
