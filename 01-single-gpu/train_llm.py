@@ -25,24 +25,24 @@ def main():
     parser = _get_parser()
     args = parser.parse_args()
 
-    # Will be modifying this in future version to include rank information
+    # 后续版本会修改这里，加入 rank 信息。
     logging.basicConfig(
         format=f"[%(asctime)s] %(levelname)s:%(message)s",
         level=logging.INFO,
     )
 
-    # Helpful to log this information when running on multiple nodes to make sure all nodes have the same environment.
+    # 在多节点运行时记录这些信息很有帮助，可以确认所有节点环境相同。
     LOGGER.debug(os.environ)
     LOGGER.debug(args)
 
-    # This guide assumes CUDA device is available, and does all training in bf16
+    # 本指南假设 CUDA 设备可用，并且全部使用 bf16 训练。
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
-    # Seed pytorch's RNG. See https://pytorch.org/docs/stable/notes/randomness.html
+    # 为 PyTorch 的随机数生成器设置种子。见 https://pytorch.org/docs/stable/notes/randomness.html
     torch.manual_seed(args.seed)
 
-    # Note: Initializing an **untrained** model
+    # 注意：这里初始化的是一个**未训练**的模型。
     model: torch.nn.Module
     with device:
         config = AutoConfig.from_pretrained(args.model_name, use_cache=False)
@@ -58,7 +58,7 @@ def main():
     train_data = _load_and_preprocess_data(args, config)
     LOGGER.debug(f"{len(train_data)} training samples")
 
-    # Standard pytorch dataset iterator
+    # 标准的 PyTorch 数据集迭代器。
     dataloader = DataLoader(
         train_data,
         batch_size=args.batch_size,
@@ -72,7 +72,7 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
 
-    # NOTE: T_max and eta_min were arbitrarily chosen
+    # 注意：T_max 和 eta_min 是任意选择的。
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=1000, eta_min=args.lr * 1e-2
     )
@@ -83,7 +83,7 @@ def main():
         is_experiment = True
         exp_dir = exp_dir / args.experiment_name
 
-    # attempt resume
+    # 尝试恢复训练。
     state = {
         "epoch": 0,
         "global_step": 0,
@@ -92,7 +92,7 @@ def main():
     }
     resumed = False
     if is_experiment and (exp_dir / "state.json").exists():
-        # NOTE: weights_only is to protect against arbitrary code execution with pickle decoding.
+        # 注意：weights_only 用于防止 pickle 解码时执行任意代码。
         def _load_to_device(p):
             return torch.load(p, map_location=device, weights_only=True)
 
@@ -109,7 +109,7 @@ def main():
         LOGGER.info(f"Creating experiment root directory")
         exp_dir.mkdir(parents=True, exist_ok=True)
 
-    # will be using to understand breakdown of speed
+    # 用来了解速度分别花在哪些部分。
     timers = {k: LocalTimer(device) for k in ["data", "forward", "backward", "update"]}
 
     for state["epoch"] in range(state["epoch"], args.num_epochs):
@@ -119,19 +119,19 @@ def main():
         if state["epoch_step"] > 0:
             progress_bar.update(state["epoch_step"])
 
-        # NOTE: This is not standard. Normally you can just iterate directly over dataloader.
-        #       We are doing this so we can explicitly measure the time it takes to generate a batch.
+        # 注意：这不是标准写法。通常可以直接遍历 dataloader。
+        #       这里手动取出下一个 batch，是为了明确测量生成一个 batch 所需的时间。
         batches = iter(dataloader)
 
         for i_step in range(len(dataloader)):
-            # Here we measure the time it takes to generate a batch and move it to the GPU
+            # 这里测量生成一个 batch 并把它移到 GPU 所需的时间。
             with timers["data"], torch.no_grad():
                 batch = next(batches)
                 batch = {k: v.to(device=device) for k, v in batch.items()}
 
-            # For resuming, this has to come after getting the next batch, so we move through the dataset properly.
+            # 为了恢复训练，这必须放在取出下一个 batch 之后，才能正确遍历数据集。
             if i_step < state["epoch_step"]:
-                # NOTE: for resuming
+                # 注意：用于恢复训练。
                 continue
 
             with timers["forward"]:
@@ -144,7 +144,7 @@ def main():
             with timers["update"]:
                 optimizer.step()
                 lr_scheduler.step()
-                # NOTE: set_to_none=True will de-allocate the gradients, saving us some memory.
+                # 注意：set_to_none=True 会释放梯度，从而节省一些内存。
                 optimizer.zero_grad(set_to_none=True)
 
             state["global_step"] += 1
@@ -217,16 +217,16 @@ def _load_and_preprocess_data(args, config):
     if seq_length > config.max_position_embeddings:
         seq_length = min(1024, config.max_position_embeddings)
 
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
+    # 主要的数据处理函数：拼接数据集中的全部文本，并生成长度为 block_size 的块。
     def group_texts(examples):
-        # Concatenate all texts.
+        # 拼接全部文本。
         concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
         total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
-        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
+        # 丢弃不足一个块的剩余部分。如果 total_length < block_size，就排除这个 batch 并返回空字典。
+        # 如果模型支持填充，也可以改成填充，而不是丢弃；这部分可以按需要自定义。
         if total_length > seq_length:
             total_length = (total_length // seq_length) * seq_length
-        # Split by chunks of max_len.
+        # 按 max_len 切成块。
         result = {
             k: [t[i : i + seq_length] for i in range(0, total_length, seq_length)]
             for k, t in concatenated_examples.items()

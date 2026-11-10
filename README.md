@@ -41,7 +41,7 @@
 ### 克隆仓库
 
 ```bash
-git clone https://github.com/LambdaLabsML/distributed-training-guide.git
+git clone -b zh-cn https://github.com/WangKangAandy/distributed-training-guide.git
 ```
 
 ### 虚拟环境

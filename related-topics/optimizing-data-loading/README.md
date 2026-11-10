@@ -1,25 +1,25 @@
-# Optimizing Data Loading
+# 优化数据加载
 
-**NOTE: This chapter's code builds off of [chapter 3](../../02-distributed-data-parallel/)'s code.**
+**注意：本章代码基于[第 3 章](../../02-distributed-data-parallel/)的代码。**
 
-An important part of achieving high throughput during distributed training is ensuring that all processes are moving at roughly the same speed. If one process is much faster, it will spend a lot of time waiting for the other processes to catch up. Data loading is actually a hugely important part of this.
+分布式训练要获得高吞吐量，一个重要部分是让所有进程的速度大致相同。如果某个进程快得多，它会花大量时间等待其他进程赶上。数据加载实际上是其中非常重要的一部分。
 
-## Motivating Example
+## 动机示例
 
-While writing this guide, I noticed a drop in GPU utilization **across all nodes** when moving from single node to multi node. When training single node, the GPU power draw was at 80%, and when I went to multi node, it dropped to 60% across all nodes.
+撰写本指南时，我发现从单节点换成多节点后，**所有节点**的 GPU 利用率都下降了。单节点训练时 GPU 功耗约为 80%，进入多节点后，所有节点都降到了 60%。
 
-It turns out data loading was consistently slower on one node, causing **all nodes** to wait for it.
+原因是某个节点的数据加载持续更慢，导致**所有节点**都在等待它。
 
-In this guide's case, since data loading is relatively fast, simply updating the number of workers and the prefetch factor fixed it. In more complex examples, other optimizations or preprocessing may be needed.
+在本指南中，数据加载相对较快，因此只需要调整 worker 数量和预取因子就能解决。在更复杂的例子中，可能还需要其他优化或预处理。
 
-## Loading data in parallel
+## 并行加载数据
 
-Most slow downs in this case all come from data size:
+这种情况下，大多数变慢都来自数据规模：
 
-1. If some of the processes read data more slowly, then they will already be behind. This can be due to disk reads being blocked, limits of open file descriptors, etc.
-2. If you have batches of different sizes, then the model forward/backward calls will take different amounts of time.
+1. 如果某些进程读取数据更慢，它们一开始就会落后。原因可能是磁盘读取被阻塞、打开文件描述符数量受限等。
+2. 如果 batch 大小不同，模型前向和反向所需的时间也会不同。
 
-Most of these can be handled simply by doing data loading in another process (via `num_workers` argument):
+大多数问题都可以通过在另一个进程中加载数据来处理（使用 `num_workers` 参数）：
 
 ```diff
  dataloader = DataLoader(
@@ -28,23 +28,24 @@ Most of these can be handled simply by doing data loading in another process (vi
      collate_fn=default_data_collator,
 +    num_workers=1,
 +    prefetch_factor=2,
-     # NOTE: this sampler will split dataset evenly across workers
+     # NOTE: 这个 sampler 会把数据集均匀分给各个 worker
      sampler=DistributedSampler(train_data, shuffle=True, drop_last=True),
  )
 ```
 
-This will cause the data loading to happen behind the scenes **in parallel to the batch processing**.
+这样数据加载会在后台进行，并且**与 batch 处理并行**。
 
-You'll need to change the num_workers and prefetch factor settings based on a number of things:
-1. How big your batch size is
-2. How long a single row from your dataset takes to load/preprocess
-3. How fast your batches take to process
+需要根据以下几项调整 `num_workers` 和预取因子：
 
-If you have `num_workers>0`, then you just want the time to fully load a batch to be less than the time to process the batch.
+1. batch size 有多大。
+2. 数据集中单行数据的加载和预处理需要多久。
+3. 处理一个 batch 有多快。
 
-## Measuring wait time
+如果 `num_workers>0`，目标就是让完整加载一个 batch 的时间少于处理这个 batch 的时间。
 
-We can measure this phenomena by adding some explicit `dist.barrier()` calls in our code with our timing wrapped around it:
+## 测量等待时间
+
+可以在代码中显式加入 `dist.barrier()`，并用计时器包住它们，从而测量这种现象：
 
 ```diff --git a/03-multi-node/train_llm.py b/06-data-loading/train_llm.py
 index d5cb05c..26cadb8 100644
@@ -63,7 +64,7 @@ index d5cb05c..26cadb8 100644
      for state["epoch"] in range(state["epoch"], args.num_epochs):
          LOGGER.info(
 @@ -168,13 +173,22 @@ def main():
-                 # NOTE: for resuming
+                 # NOTE: 用于恢复训练
                  continue
  
 +            with timers["waiting"]:
@@ -87,16 +88,15 @@ index d5cb05c..26cadb8 100644
                  lr_scheduler.step()
 ```
 
+## 更快的存储
 
-## Faster storage
+一种非常常见的配置是把所有数据放在网络存储上。这对代码来说很方便，但对读取数据并不是最高效的。
 
-A very common setup is to have all of your data on networked data storage. While this is convenient for our code, it is not the most efficient for data reading.
+类似于缓存快于内存、内存快于磁盘，节点本地存储也比网络存储快得多：
 
-Similar to how the cache is faster than ram, and ram is faster than disk - local node storage is much faster than networked storage:
+1. 缓存（最快）
+2. 内存
+3. 机器本地磁盘
+4. 网络磁盘（最慢）
 
-1. Cache (Fastest)
-2. RAM
-3. Machine local disk
-4. Networked disk (Slowest)
-
-Simply copying all of your data to each node individual can improve the speed of data loading, at the cost of more storage.
+把所有数据复制到每个节点，可以提高数据加载速度，但代价是占用更多存储。

@@ -43,7 +43,7 @@ torchrun \
 - `rank`：这个 worker 的全局唯一编号，范围是 `0` 到 `world_size - 1`（含两端）。
 - `local_rank`：这台机器内部的编号，范围是 `0` 到 `torch.cuda.device_count() - 1`（含两端）。
 
-## 分布式训练如何工作
+## <a id="how-distributed-training-works"></a>分布式训练如何工作
 
 在讲分布式训练需要改什么之前，先想一下原理。做过并行计算的话就会知道，一种并行方式是把工作量分到所有核心上。当每份待处理任务大体相同时，这非常有效。Python 的 `multiprocessing.Pool.map` 就是这样做的。
 
@@ -78,7 +78,7 @@ PyTorch 如何实现这一点？
 2. [用 DistributedSampler 在 worker 之间切分数据。](#using-distributedsampler)
 3. [用 DistributedDataParallel 同步梯度。](#using-distributeddataparallel)
 
-## 用 `torchrun` 代替 `python`
+## <a id="using-torchrun-instead-of-python"></a>用 `torchrun` 代替 `python`
 
 用 `torchrun` 启动分布式训练时，它会**启动 N 个独立进程**（N 是 `--nproc-per-node` 指定的 GPU 数量），每个进程都运行同一份训练脚本：
 
@@ -120,9 +120,9 @@ Launches subproc `$RANK=2 $WORLD_SIZE=3 train_llm.py ...`
 
 可以先查看可用核心数，再按进程分配。例如机器有 32 个核心、8 张 GPU，就可以把 `OMP_NUM_THREADS` 设为 4。
 
-## 代码改动
+## <a id="code-changes"></a>代码改动
 
-### 调用 `dist.init_process_group()` 和 `torch.cuda.set_device()`
+### <a id="calling-distinit_process_group-and-torchcudaset_device"></a>调用 `dist.init_process_group()` 和 `torch.cuda.set_device()`
 
 调用其他 `dist` API 之前，这两个都必须先调用。
 
@@ -148,7 +148,7 @@ Launches subproc `$RANK=2 $WORLD_SIZE=3 train_llm.py ...`
 
 如果不调用 `torch.cuda.set_device`，进程可能不会使用正确的 CUDA 设备。
 
-### 在日志中包含 rank
+### <a id="including-rank-in-logging-statements"></a>在日志中包含 rank
 
 所有进程可能写到同一个文件；即使只查看一份日志，每条记录带上 rank 也更方便：
 
@@ -160,7 +160,7 @@ Launches subproc `$RANK=2 $WORLD_SIZE=3 train_llm.py ...`
  )
 ```
 
-### 使用 DistributedDataParallel
+### <a id="using-distributeddataparallel"></a>使用 DistributedDataParallel
 
 ```diff
 +from torch.nn.parallel import DistributedDataParallel
@@ -185,7 +185,7 @@ gradient = param.grad / self.process_group.size()
 gradient = fcol.all_reduce(gradient, "sum", self.process_group)
 ```
 
-### 使用 DistributedSampler
+### <a id="using-distributedsampler"></a>使用 DistributedSampler
 
 普通训练脚本用 `torch.utils.data.DataLoader` 组 batch。DataLoader 的一个参数是 `sampler`，构造 batch 时从数据集中取样。可以把 sampler 理解成：
 
@@ -228,7 +228,7 @@ def distributed_sampler():
 
 > 在分布式模式下，每个 epoch 开始、创建 DataLoader 迭代器之前必须调用 `set_epoch()`，多个 epoch 之间的打乱才能正常工作。否则会一直使用相同顺序。
 
-### 先由 rank 0 下载模型和数据
+### <a id="downloading-model--data-in-rank-0-first"></a>先由 rank 0 下载模型和数据
 
 这主要是因为加载数据时可能下载或预处理数据并写入磁盘。
 
@@ -266,7 +266,7 @@ def rank0_first():
      train_data = _load_and_preprocess_data(args, tokenizer, config)
 ```
 
-### 只在 rank 0 创建实验目录
+### <a id="only-creating-experiment-directory-on-rank-0"></a>只在 rank 0 创建实验目录
 
 注意创建目录前后的 `dist.barrier()`。**它们非常重要！**
 
@@ -278,7 +278,7 @@ def rank0_first():
 +dist.barrier()
 ```
 
-### 只由 rank 0 保存检查点
+### <a id="save-checkpoint-on-rank-0"></a>只由 rank 0 保存检查点
 
 只让一个 rank 保存检查点。否则多个 rank 可能写同一个文件并互相破坏。
 
@@ -293,7 +293,7 @@ def rank0_first():
 +    dist.barrier()
 ```
 
-## 优化显存：Zero Redundancy Optimizer
+## <a id="optimizing-memory---zero-redundancy-optimizer"></a>优化显存：Zero Redundancy Optimizer
 
 DDP 在每张 GPU 上都保存完整模型和优化器。对优化器来说尤其浪费。好在可以直接加入 [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054) 来降低显存占用：
 
@@ -308,7 +308,7 @@ DDP 在每张 GPU 上都保存完整模型和优化器。对优化器来说尤�
 
 可惜保存 ZeRO 状态字典的代码极其慢，所以还要去掉优化器状态字典的保存。
 
-## 多节点如何工作
+## <a id="how-multi-node-works"></a>多节点如何工作
 
 它和单节点多 GPU 的工作方式基本相同。单节点时已经有多个进程，多节点只是把额外进程放到不同机器上。
 
@@ -320,19 +320,19 @@ DDP 在每张 GPU 上都保存完整模型和优化器。对优化器来说尤�
 
 超过一个节点后，错误报告和处理变得极其重要。网络问题很常见，还必须保证机器之间的一些细微配置完全一致。
 
-## 共享存储：在节点之间管理 Python 虚拟环境
+## <a id="shared-storage---managing-your-python-virtual-environment-across-nodes"></a>共享存储：在节点之间管理 Python 虚拟环境
 
 最简单的方法是把 Python 虚拟环境创建在所有节点都能访问的共享网络盘上。这样所有节点使用完全相同的 Python 可执行文件和环境。
 
 创建方式和普通虚拟环境一样，只是目录必须共享。
 
-## 共享存储：在节点之间管理数据集和模型检查点
+## <a id="shared-storage---mangaging-your-datasetmodel-checkpoints-across-nodes"></a>共享存储：在节点之间管理数据集和模型检查点
 
 同样，最简单的方法是把数据放在共享网络盘。需要注意，共享网络盘的读取通常比节点本地盘慢。如果数据加载变慢，可以把数据或模型复制到节点本地存储。
 
 使用 `transformers` 或 `datasets` 时，设置 `$HF_HOME` 来控制 Hugging Face 下载数据集和模型权重的位置。
 
-## `$HF_HOME`：已下载的模型与数据集目录
+## <a id="hf_home---the-downloaded-modeldataset-directory"></a>`$HF_HOME`：已下载的模型与数据集目录
 
 Hugging Face 的 `transformers` 和 `datasets` 默认把内容下载到 `$HF_HOME`。`$HF_HOME` 的默认值是**节点本地**目录。这里有两个选择：
 

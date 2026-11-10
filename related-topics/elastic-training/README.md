@@ -1,10 +1,10 @@
-# Elastic Training
+# 弹性训练
 
-Elastic training is training where the launcher can restart a subset (or all) of the workers at various points throughout training.
+弹性训练是指启动器可以在训练过程中的不同时刻重启一部分（或全部）worker。
 
-Contrary to what you might think, usually when 1 worker encounters an error, **ALL workers are restarted** (see https://pytorch.org/docs/stable/elastic/run.html#membership-changes).
+与你可能的预期相反，通常只要 1 个 worker 遇到错误，**所有 worker 都会重启**（见 https://pytorch.org/docs/stable/elastic/run.html#membership-changes）。
 
-`torchrun` supports this via [elastic launch](https://pytorch.org/docs/stable/elastic/run.html#elastic-min-1-max-4-tolerates-up-to-3-membership-changes-or-failures):
+`torchrun` 通过[弹性启动](https://pytorch.org/docs/stable/elastic/run.html#elastic-min-1-max-4-tolerates-up-to-3-membership-changes-or-failures)支持这一点：
 
 ```bash
 torchrun
@@ -13,15 +13,16 @@ torchrun
     ...
 ```
 
-which means that torchrun will restart all the workers up to 3 times (and if some of the nodes go offline, it can use as few as 1).
+这表示 `torchrun` 最多重启所有 worker 3 次；如果某些节点离线，它最少可以使用 1 个节点。
 
-Note:
-- `rank`, `local_rank`, and `world_size` are all not stable across restarts of a worker.
-- Sometimes nodes have issues that can't be fixed just by restarting (like if you have a bug).
+注意：
 
-## Code Changes
+- worker 重启后，`rank`、`local_rank` 和 `world_size` 都不稳定。
+- 有些节点问题无法只靠重启解决，例如代码本身有 bug。
 
-No code changes are needed to do elastic training for our existing code. Instead it is more informative to play with a toy example where workers randomly crash to give you a sense for how it works.
+## 代码改动
+
+现有代码做弹性训练不需要修改。更有帮助的是运行一个 worker 随机崩溃的示例，感受它如何工作。
 
 ```bash
 cd distributed-training-guide/96-elastic-training
@@ -34,6 +35,6 @@ torchrun \
     toy.py
 ```
 
-This toy script will randomly throw an error from each of the ranks. **No GPU required to try this command!**
+这个示例脚本会从各个 rank 随机抛出错误。**试用这条命令不需要 GPU。**
 
-Inspect the log directory after you run this, for each attempt, there will be 1 worker sub directory that has a `error.json` file in it. You can also inspect each worker's stdout/stderr.
+运行后查看日志目录。每次尝试都会有一个 worker 子目录包含 `error.json`。也可以查看每个 worker 的标准输出和标准错误。

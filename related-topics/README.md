@@ -1,5 +1,12 @@
-# Related topics
+# 相关主题
 
-This directory contains a list of additional topics that are adjacent to everything discussed in prior chapters.
+本目录包含一组与前面各章内容相邻的附加主题。
 
-These chapters don't contain a training script individually, but the changes discussed in each are relatively small, and code snippets are provided to make it easy to add the features into your code.
+这些章节各自不包含完整训练脚本，但讨论的改动都相对较小，并提供代码片段，便于把这些功能加入你的代码。
+
+- [确定性](./determinism/)
+- [有效 batch size 与学习率](./effective-batch-size-and-lr/)
+- [弹性训练](./elastic-training/)
+- [梯度累积](./gradient-accumulation/)
+- [优化数据加载](./optimizing-data-loading/)
+- [wandb 配置](./wandb-configurations/)

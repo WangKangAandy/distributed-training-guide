@@ -19,7 +19,7 @@
 - [监控](#monitoring)
 - [运行统计](#run-statistics)
 
-## 使用 Flash Attention
+## <a id="use-flash-attention"></a>使用 Flash Attention
 
 Flash Attention 是缩放点积注意力的融合实现，能大幅降低显存占用。它的核心目标是尽量少访问内存，并减少临时内存。
 
@@ -44,7 +44,7 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 ```
 
-## 下载模型权重
+## <a id="download-model-weights"></a>下载模型权重
 
 实际模型权重非常大：共有 191 个独立文件，每个约 4GB，总计约 764GB。
 
@@ -71,7 +71,7 @@ python download.py --skip-model
 
 注意：通常需要先用 `hf auth login` 登录 Hugging Face 账号。
 
-## 加载预训练权重
+## <a id="loading-pretrained-weights"></a>加载预训练权重
 
 ### 把模型加载到 CPU 内存
 
@@ -163,11 +163,11 @@ if rank == 0:
 del full_model
 ```
 
-## 给 Llama 405B 分片
+## <a id="sharding-llama-405b"></a>给 Llama 405B 分片
 
 上一节已经按解码器层调用了 `fully_shard()`。顶层模型使用 `reshard_after_forward=False`，解码器层使用 `reshard_after_forward=True`。
 
-## 梯度（也就是激活）检查点
+## <a id="gradient-aka-activation-checkpointing"></a>梯度（也就是激活）检查点
 
 降低显存占用的另一项技术是梯度检查点，最早见于 [Training Deep Nets with Sublinear Memory Cost](https://arxiv.org/abs/1604.06174)。正常前向时，必须把输入和输出保留到反向执行。保存这些中间张量会占用大量显存。使用梯度检查点后，反向期间会**重新执行**前向来再生输出。因此计算更多，但能节省大量显存。
 
@@ -193,7 +193,7 @@ apply_activation_checkpointing(
 )
 ```
 
-## CPU 卸载与融合优化器内核
+## <a id="cpu-offload--fused-optimizer-kernels"></a>CPU 卸载与融合优化器内核
 
 模型非常大，因此基本上必须启用 FSDP 的 [CPU 卸载](../04-fully-sharded-data-parallel/README.md#cpu-offload)。**使用 FSDP 的 CPUOffload 功能时，优化器完全在 CPU 上运行。** 这是因为执行 `optimizer.step()` 时，在 GPU 和 CPU 之间传输数据的成本很高。撰写本文时，如何让 `optimizer.step()` 与下一次 `forward()` 重叠仍有未解决的问题。
 
@@ -218,7 +218,7 @@ model.loss_function = torch.compile(model.loss_function)
 optimizer.step = torch.compile(optimizer.step)
 ```
 
-## 不要释放梯度
+## <a id="not-de-allocating-gradients"></a>不要释放梯度
 
 你可能见过 [optimizer.zero_grad()](https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.zero_grad.html) 的 `set_to_none` 参数。文档说：
 
@@ -230,7 +230,7 @@ optimizer.step = torch.compile(optimizer.step)
 optimizer.zero_grad(set_to_none=not args.cpu_offload)
 ```
 
-## 启动命令
+## <a id="launch-command"></a>启动命令
 
 相对基础的 [FSDP 代码](../04-fully-sharded-data-parallel/)，需要的改动就是这些。现在启动训练。
 
@@ -245,7 +245,7 @@ bash launch.sh # 注意：这条命令不会阻塞
 
 可以修改本目录 [hosts](./hosts) 文件中的主机名。
 
-## 监控
+## <a id="monitoring"></a>监控
 
 [launch.sh](./launch.sh) 使用 `torchrun`，因此每个节点都会有一个输出目录，其中还有多个包含日志文件的子目录。逐个查看比较麻烦，可以用下面的 Bash 命令同时跟踪全部日志：
 
@@ -269,7 +269,7 @@ python ../top-cluster.py hosts
 xargs -a hosts -I{} ssh {} tmux kill-session -t torchrun-llama-405b
 ```
 
-## 运行统计
+## <a id="run-statistics"></a>运行统计
 
 在 64 张 H100 GPU（8 个独立节点）上，使用 `--seq-length 4096` 和 `--batch-size 1` 训练时，统计如下：
 

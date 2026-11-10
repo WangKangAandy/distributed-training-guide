@@ -1,10 +1,10 @@
-# Diagnosing Errors
+# 诊断错误
 
-Hanging and deadlocks can be caused by so many things, even your own code! Here's some diagnostic tools that will help you figure out what is going on.
+挂起和死锁可能由很多原因引起，甚至包括你自己的代码。下面这些诊断工具可以帮助判断发生了什么。
 
-## System metrics to watch for to diagnose hanging
+## 诊断挂起时要观察的系统指标
 
-`GPU Power Usage` will be the main one - if the training process is hanging, then the power usage will drop to around ~10% for all workers:
+`GPU Power Usage` 是最主要的指标。如果训练进程挂起，所有 worker 的功耗都会降到大约 10%：
 
 ```bash
 > nvidia-smi --query-gpu=power.draw,power.limit --format=csv,noheader
@@ -18,7 +18,7 @@ Hanging and deadlocks can be caused by so many things, even your own code! Here'
 70.87 W, 700.00 W
 ```
 
-Using our provided [top-cluster.py](../top-cluster.py) script will output something like this:
+使用提供的 [top-cluster.py](../top-cluster.py) 脚本会输出类似下面的内容：
 
 ```bash
 > python top-cluster.py <hosts file>
@@ -36,39 +36,39 @@ node-008	    100.0%	    100.0%	     96.2%	         8
 ===
 ```
 
-## Getting a dump of stack traces
+## 获取堆栈跟踪转储
 
-Use [py-spy](https://github.com/benfred/py-spy) to get a dump of stacktraces from all python threads in a running python program. Here's how you get a dump from each worker:
+使用 [py-spy](https://github.com/benfred/py-spy) 可以转储正在运行的 Python 程序中所有 Python 线程的堆栈跟踪。从每个 worker 获取转储的方法是：
 
 ```
 sudo env "PATH=$PATH" py-spy dump --locals --pid <PID of the torchrun process>
 ```
 
-## Benchmarking/profiling
+## 基准测试与性能分析
 
-You can use `py-spy top --pid <>`, to get a `top`/`htop` like view of the functions that are being called in your python process.
+可以使用 `py-spy top --pid <>`，获得类似 `top` / `htop` 的视图，查看 Python 进程正在调用哪些函数。
 
-## Recording errors
+## 记录错误
 
-Python has a great built in library for getting errors that occur in any thread of a python program called [faulthandler](https://docs.python.org/3/library/faulthandler.html). This is especially useful when you're using a DataLoader with num_workers > 0.
+Python 有一个很好的内置库 [faulthandler](https://docs.python.org/3/library/faulthandler.html)，可以获取 Python 程序任意线程中发生的错误。当 DataLoader 的 `num_workers > 0` 时，它尤其有用。
 
-Turns out, pytorch already has a built in way to use it! You just have to set `TORCHELASTIC_ERROR_FILE=../error.json` environment variable and add a `@record` annotation to your main function. 
+实际上，PyTorch 已经内置了使用它的方法。只需设置环境变量 `TORCHELASTIC_ERROR_FILE=../error.json`，并给 `main` 函数加上 `@record` 注解。
 
 ```python
 from torch.distributed.elastic.multiprocessing.errors import record
 
-# NOTE: records errors to $TORCHELASTIC_ERROR_FILE
+# NOTE: 把错误记录到 $TORCHELASTIC_ERROR_FILE
 @record
 def main():
     ...
 ```
 
-Luckily all the code in this guide has been doing this, and so should you! **Make sure to set $TORCHELASTIC_ERROR_FILE**!.
+好在本指南中的所有代码都已经这样做了，你也应该这样做。**一定要设置 `$TORCHELASTIC_ERROR_FILE`。**
 
-## Checklist for system problems
+## 系统问题检查清单
 
-1. System date time on each system is the same (can cause NCCL timeouts)
-2. NVLink valid topology `nvidia-smi topo -m`
-3. NVLink status `nvidia-smi topo -p2p n` (additionally `w`/`r` in place of `n`)
-4. Open file descriptor limit `ulimit -aH` (and then look for line containing `open files`).
-5. `timeout` in `dist.init_process_group(timeout=...)` is sufficiently large.
+1. 每台机器的系统日期和时间相同（不一致可能导致 NCCL 超时）。
+2. NVLink 拓扑有效：`nvidia-smi topo -m`。
+3. NVLink 状态：`nvidia-smi topo -p2p n`（也可以把 `n` 换成 `w` 或 `r`）。
+4. 打开文件描述符上限：`ulimit -aH`，然后查看包含 `open files` 的那一行。
+5. `dist.init_process_group(timeout=...)` 中的 `timeout` 足够大。

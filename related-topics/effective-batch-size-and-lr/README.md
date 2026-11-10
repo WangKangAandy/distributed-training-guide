@@ -1,44 +1,46 @@
-# Effective Batch Size and LR
+# 有效 batch size 与学习率
 
-As you scale up the number of nodes, the effective batch size (the amount of items used for model updates) increases as well:
+随着节点数量增加，有效 batch size（用于模型更新的样本数量）也会增加：
 
 ```
 effective_batch_size = batch_size * world_size
 ```
 
-As you may know, increasing the batch size means that the variance of the data that your model is training on decreases, meaning your gradients will be much smoother. This directly impacts the dynamics of how your model learns and changes!
+你可能知道，增大 batch size 会降低模型训练数据的方差，从而使梯度更平滑。这会直接影响模型学习和变化的动态。
 
-If you want to **exactly match the dynamics of single gpu training** when moving to multi node training, this chapter is aimed at you!
+如果从单卡训练迁移到多节点训练时，希望**精确匹配单卡训练的动态**，本章就是为你准备的。
 
-## Scaling Rules
+## 缩放规则
 
-If you want exact training dynamics, you have to also scale the learning rate. However, this depends on what optimizer you are using. The exact rules are not fully understood, and you can look into the following papers for more information:
+如果希望训练动态完全一致，还必须缩放学习率。不过这取决于使用的优化器。精确规则尚未被完全理解，可以参考以下论文：
 
 - [Exploring Learning Rate Scaling Rules for Distributed ML Training on Transient Resources](https://anakli.inf.ethz.ch/papers/learning_rate_distribml22.pdf)
 
-As of writing this, the most common rules that people use to scale learning rate are:
+撰写本文时，人们最常用的学习率缩放规则是：
 
-### Linear scaling rule
+### 线性缩放规则
 
 ```python
 lr = args.lr * dist.get_world_size()
 ```
 
-This was first reported in the large minibatch SGD paper above. However this doesn't quite produce exactly the same training dynamics, and the paper actually used a **factor of the world size**.
+它最早出现在上面提到的大批量 SGD 论文中。不过它并不能完全产生相同的训练动态，论文实际使用的是 **world size 的某个系数**。
 
-NOTE: **Be careful when using this for optimizers other than SGD**
+注意：**对 SGD 以外的优化器使用这条规则时要小心。**
 
-References:
+参考资料：
+
 - [Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour](https://arxiv.org/pdf/1706.02677)
 
-### Square root scaling rule
+### 平方根缩放规则
 
 ```python
 lr = args.lr * numpy.sqrt(dist.get_world_size())
 ```
 
-This is proposed for use with the Adam optimizer, and maintains the square root of the variance of the gradient when scaling the number of batches.
+这条规则建议用于 Adam 优化器。扩大 batch 数量时，它保持梯度方差的平方根。
 
-References:
+参考资料：
+
 - [One weird trick for parallelizing convolutional neural networks](https://arxiv.org/pdf/1404.5997)
 - [Large-Batch Training for LSTM and Beyond](https://arxiv.org/pdf/1901.08256)

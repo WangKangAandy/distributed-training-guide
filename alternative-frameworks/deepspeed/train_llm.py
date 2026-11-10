@@ -59,8 +59,8 @@ def main():
             model = AutoModelForCausalLM.from_config(config, dtype=dtype)
     LOGGER.info(f"{sum(p.numel() for p in model.parameters())} model parameters")
 
-    # NOTE: since this can download data, make sure to do the main process first
-    # NOTE: This assumes that the data is on a **shared** network drive, accessible to all processes
+    # 注意：这里可能会下载数据，因此要让主进程先执行。
+    # 注意：这里假设数据位于所有进程都能访问的**共享**网络盘。
     with rank0_first():
         train_data = _load_and_preprocess_data(args, config)
     LOGGER.info(f"{len(train_data)} training samples")
@@ -76,14 +76,14 @@ def main():
         train_data,
         batch_size=model_engine.train_micro_batch_size_per_gpu(),
         collate_fn=default_data_collator,
-        # NOTE: this sampler will split dataset evenly across workers
+        # 注意：这个 sampler 会把数据集均匀分给各个 worker。
         sampler=DistributedSampler(train_data, shuffle=True, drop_last=True),
     )
     LOGGER.info(f"{len(dataloader)} batches per epoch")
 
     exp_dir: Path = Path(args.save_dir) / args.experiment_name
 
-    # attempt resume
+    # 尝试恢复训练。
     state = {
         "epoch": 0,
         "global_step": 0,
@@ -141,7 +141,7 @@ def main():
                 batch = {k: v.to(device=device) for k, v in batch.items()}
 
             if i_step < state["epoch_step"]:
-                # NOTE: for resuming
+                # 注意：用于恢复训练。
                 continue
 
             with timers["forward"]:
@@ -226,16 +226,16 @@ def _load_and_preprocess_data(args, config):
     if seq_length > config.max_position_embeddings:
         seq_length = min(1024, config.max_position_embeddings)
 
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
+    # 主要的数据处理函数：拼接数据集中的全部文本，并生成长度为 block_size 的块。
     def group_texts(examples):
-        # Concatenate all texts.
+        # 拼接全部文本。
         concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
         total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
-        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
+        # 丢弃不足一个块的剩余部分。如果 total_length < block_size，就排除这个 batch 并返回空字典。
+        # 如果模型支持填充，也可以改成填充，而不是丢弃；这部分可以按需要自定义。
         if total_length > seq_length:
             total_length = (total_length // seq_length) * seq_length
-        # Split by chunks of max_len.
+        # 按 max_len 切成块。
         result = {
             k: [t[i : i + seq_length] for i in range(0, total_length, seq_length)]
             for k, t in concatenated_examples.items()

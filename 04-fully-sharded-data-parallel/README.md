@@ -82,7 +82,7 @@ fully_shard(model, **fsdp_config)
 
 如果设置 `reshard_after_forward=False`，则要等到反向传播结束后才重新分片。
 
-#### CPU 卸载
+#### <a id="cpu-offload"></a>CPU 卸载
 
 摘自 [CPUOffloadPolicy 文档](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html#torch.distributed.fsdp.CPUOffloadPolicy)：
 

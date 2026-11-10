@@ -10,7 +10,7 @@
 - [mpi](#mpirun)
 - [deepspeed](#deepspeed)
 
-## Bash 命令（xargs/ssh/tmux）
+## <a id="bash-commands-xargssshtmux"></a>Bash 命令（xargs/ssh/tmux）
 
 我们主要需要在其他机器上创建进程，因此可以把几个 Bash 工具组合起来。这是最轻量的方法之一，也方便按需要修改命令。理解这些 Bash 命令如何配合需要一点时间，但它们也能用到其他问题上。
 
