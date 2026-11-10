@@ -1,23 +1,23 @@
-# Single GPU
+# 单卡 GPU
 
-This is the "standard" single gpu training script. It doesn't do anything with distributed, and aims to be as simple as possible.
+这是一份「标准」的单卡训练脚本。它不做任何分布式操作，目标是尽量简单。
 
-The rest of this guide uses this code as the basis, so this chapter explains all the different parts of the code and why we do them.
+本指南后面的内容都以这份代码为基础，所以这一章会说明代码的各个部分，以及为什么要这样写。
 
-## Command
+## 命令
 
 ```bash
 cd distributed-training-guide/01-single-gpu
 python train_llm.py -d tatsu-lab/alpaca -m openai-community/gpt2
 ```
 
-## Code explanation
+## 代码说明
 
-This explanation goes roughly in code order, starting from the top.
+说明大致按代码顺序，从文件顶部开始。
 
-### Argument parsing
+### 参数解析
 
-Our training script is a CLI (command line interface) program. That means you run it from a terminal. We have a variety of arguments we'd like the user (you) to be able to change using the CLI. So this is a very standar python way to enable that:
+训练脚本是一个命令行程序，也就是从终端运行。我们希望使用者能在命令行里修改一批参数。下面是很常见的 Python 写法：
 
 ```python
 def main():
@@ -44,9 +44,9 @@ if __name__ == "__main__":
     main()
 ```
 
-### Setting up logging
+### 配置日志
 
-For this guide, we just use the built in `logging` package for python. This will output everything to stdout/stderr, and we use command line tools to redirect this output to files for later.
+本指南只用 Python 内置的 `logging`。日志会输出到标准输出和标准错误，之后再用命令行工具把输出重定向到文件。
 
 ```python
 LOGGER = logging.getLogger(__name__)
@@ -60,11 +60,11 @@ LOGGER.info(os.environ)
 LOGGER.info(args)
 ```
 
-It's useful to be able to see what the environment variables & CLI args we are running the program with (especially with multiple nodes involved later). So we log those first.
+能看到程序运行时的环境变量和命令行参数很有用，后面涉及多台机器时尤其如此。所以这两项最先记录。
 
-### pytorch setup
+### PyTorch 初始化
 
-As we are using pytorch there are a couple of useful things to do before we initialize anything
+使用 PyTorch 时，在初始化其他对象之前有几件有用的事要做：
 
 ```python
 device = torch.device("cuda")
@@ -72,26 +72,26 @@ dtype = torch.bfloat16
 torch.manual_seed(args.seed)
 ```
 
-Here we are saying that the device we will be using for the rest of the script is a GPU (specifically a CUDA device), and that we are going to be training with bfloat16 (aka bf16) which is a 16 bit floating point number (float is 32 bit, and double is 64 bits).
+这里指定脚本其余部分使用 GPU（具体是 CUDA 设备），并用 bfloat16（也叫 bf16）训练。它是 16 位浮点数；float 是 32 位，double 是 64 位。
 
-### Initializing the model
+### 初始化模型
 
-We are training a BF16 causal language model (think GPT) using `transformers`
+我们用 `transformers` 训练一个 BF16 因果语言模型（可以把它理解成 GPT）：
 
 ```python
 config = AutoConfig.from_pretrained(args.model_name, use_cache=False)
 model = AutoModelForCausalLM.from_config(config, dtype=dtype).to(device)
 ```
 
-### Initializing our dataset
+### 初始化数据集
 
-We are using `datasets` to load and preprocess our dataset. The processing code used in this guide was sourced from https://github.com/huggingface/transformers/blob/v4.45.1/examples/pytorch/language-modeling/run_clm_no_trainer.py.
+我们用 `datasets` 加载并预处理数据。本指南的处理代码来自 https://github.com/huggingface/transformers/blob/v4.45.1/examples/pytorch/language-modeling/run_clm_no_trainer.py。
 
-Encourage readers to check out datasets if they want more information.
+如果想了解更多，建议读者直接查看 `datasets`。
 
-### Data Loading, LR Schedule, Optimizer
+### 数据加载、学习率调度和优化器
 
-The next section of code is fairly standard pytorch. We are using a DataLoader to iterate our dataset, the AdamW optimizer, and a Cosine Annealing LR schedule.
+下一段是比较标准的 PyTorch：用 DataLoader 遍历数据集，优化器是 AdamW，学习率调度是余弦退火。
 
 ```python
 dataloader = DataLoader(
@@ -109,17 +109,17 @@ lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
 )
 ```
 
-Note: The `fused=True` argument to the optimizer results in a fused kernel being used. This is faster in pretty much all cases, so we enable it in all the chapters in this guide!!
+注意：优化器的 `fused=True` 会使用融合内核。几乎所有情况下都更快，所以本指南每一章都打开它。
 
-### Outputs & Resuming
+### 输出与恢复训练
 
-We save checkpoints into `args.save_dir/args.experiment_name` - `--experiment-name is a **unique** run identifier
+检查点保存在 `args.save_dir/args.experiment_name`。`--experiment-name` 是一次运行的**唯一**标识。
 
 ```python
 exp_dir: Path = Path(args.save_dir) / args.experiment_name
 ```
 
-If `args.save_dir/args.experiment_name/state.json` already exists, we attempt to resume. This means if a checkpoint already exists for our experiment_name, then we interpret this as a resumed run.
+如果 `args.save_dir/args.experiment_name/state.json` 已经存在，就尝试恢复。也就是说，这个实验名已经有检查点时，我们把它解释为一次续训。
 
 ```python
 state = {
@@ -138,30 +138,30 @@ if (exp_dir / "state.json").exists():
     resumed = True
 ```
 
-### Iterating our batches
+### 遍历 batch
 
-We do this in a non-standard way so we can time various parts of the training loop. Normally, we wouldn't be able to time the actual construction of the batch, but by manually pulling the next batch using `next()`, we can time it:
+这里没有用最常见的写法，是为了给训练循环的各部分计时。通常无法计时 batch 的实际构造过程；手动用 `next()` 取出下一个 batch 后，就可以计时：
 
 ```python
 batches = iter(dataloader)
 
 for i_step in range(len(dataloader)):
-    # Here we measure the time it takes to generate a batch and move it to the GPU
+    # 这里测量生成一个 batch 并把它移到 GPU 所需的时间
     with timers["data"], torch.no_grad():
         batch = next(batches)
         batch = {k: v.to(device=device) for k, v in batch.items()}
 ```
 
-### Forward/backward/update
+### 前向、反向和参数更新
 
-This is standard pytorch code, with the addition of timing so we can benchmark:
+这是标准 PyTorch 代码，只是加了计时，方便做基准测试：
 
 ```python
 with timers["forward"]:
     outputs = model(**batch)
 
 with timers["backward"]:
-    # NOTE: set_to_none=True will de-allocate the gradients, saving us some memory.
+    # set_to_none=True 会释放梯度占用的内存。
     optimizer.zero_grad(set_to_none=True)
     outputs.loss.backward()
 
@@ -170,13 +170,13 @@ with timers["update"]:
     lr_scheduler.step()
 ```
 
-### Logging to stdout
+### 输出到标准输出
 
-The next blocks of code involve logging various tidbits about how our training is going:
+接下来的代码记录训练进展的各项信息。
 
-We do this based on the `--log-freq` argument, e.g. if we do `--log-freq 100` we will log this data every 100 steps.
+记录频率由 `--log-freq` 决定。例如 `--log-freq 100` 表示每 100 步记录一次。
 
-Note that we both log to our LOGGER, and also wandb.
+注意：我们既写入 LOGGER，也写入 wandb。
 
 ```python
 if state["global_step"] % args.log_freq == 0:
@@ -201,11 +201,11 @@ if state["global_step"] % args.log_freq == 0:
         t.reset()
 ```
 
-### Checkpoints
+### 检查点
 
-The final block of code is our checkpointing logic, here just using `torch.save`.
+最后一段是保存检查点的逻辑，这里直接使用 `torch.save`。
 
-Note that we are saving the optimizer and LR scheduler in addition to the model!
+注意：除了模型，还要保存优化器和学习率调度器。
 
 ```python
 if state["global_step"] % args.ckpt_freq == 0:

@@ -1,51 +1,50 @@
-# Distributed Training Guide
+# 分布式训练指南
 
-🔥 News 🔥
+🔥 新消息 🔥
 
-- [Pytorch Conference 2025 slides](https://docs.google.com/presentation/d/126BQcCJti_z3NQ7cGbm2iMBDVG7-0ekitxU3pvJ_WQw/edit?usp=sharing)
-- [Neurips 2024 slides](https://docs.google.com/presentation/d/1ANMmkOGaruYKTvhnsAbZgI9GrdMliNvibWGuNYw6HX8/edit?usp=sharing)
+- [PyTorch Conference 2025 幻灯片](https://docs.google.com/presentation/d/126BQcCJti_z3NQ7cGbm2iMBDVG7-0ekitxU3pvJ_WQw/edit?usp=sharing)
+- [NeurIPS 2024 幻灯片](https://docs.google.com/presentation/d/1ANMmkOGaruYKTvhnsAbZgI9GrdMliNvibWGuNYw6HX8/edit?usp=sharing)
 
 <img src="https://lambdalabs.com/hubfs/distriubuted-training-guide.png" width="400px" />
 
-Ever wondered how to train a large neural network across a giant cluster? Look no further!
+想知道如何在大型集群上训练一个大神经网络？看这篇就够了。
 
-This is a comprehensive guide on best practices for distributed training, diagnosing errors, and fully utilizing all resources available. It is organized into sequential chapters, each with a `README.md` and a `train_llm.py` script in them. The readme will discuss both the high level concepts of distributed training, and the code changes introduced in that chapter.
+这是一份关于分布式训练最佳实践、错误诊断以及充分利用现有资源的完整指南。内容按顺序分成若干章，每一章都有一份 `README.md`，多数还有一份 `train_llm.py` 脚本。README 会同时讲分布式训练的高层概念，以及该章引入的代码改动。
 
-The guide is written entirely in very minimal standard pytorch, using `transformers` and `datasets` for models and data, respectively. No other library is used for distributed code - the distributed stuff is entirely in pytorch.
+指南全部使用非常精简的标准 PyTorch 编写，模型用 `transformers`，数据用 `datasets`。分布式相关代码不再依赖其他库，全部写在 PyTorch 里。
 
-1. [Chapter 1](./01-single-gpu/) - A standard Causal LLM training script that runs on a **single GPU**.
-2. [Chapter 2](./02-distributed-data-parallel/) - Upgrades the training script to support **multiple GPUs and to use DDP**.
-3. [Chapter 3](./03-job-launchers/) - Covers how to **launch training jobs** across clusters with multiple nodes.
-4. [Chapter 4](./04-fully-sharded-data-parallel/) - Upgrades the training script to **use FSDP** instead of DDP for more optimal memory usage.
-5. [Chapter 5](./05-training-llama-405b/) - Upgrades the training script to **train Llama-405b**.
-6. [Chapter 6](./06-tensor-parallel/) - Upgrades our single GPU training script to support **tensor parallelism**.
-7. [Chapter 7](./06-2d-parallel/) - Upgrades our TP training script to use **2d parallelism (FSDP + TP)**.
-8. [Alternative Frameworks](./alternative-frameworks/) - Covers different frameworks that all work with pytorch under the hood.
-9. [Diagnosing Errors](./diagnosing-errors/) - Best practices and how tos for **quickly diagnosing errors** in your cluster.
-10. [Related Topics](./related-topics/) - Topics that you should be aware of when distributed training.
+1. [第 1 章](./01-single-gpu/)：标准的因果语言模型训练脚本，在**单张 GPU** 上运行。
+2. [第 2 章](./02-distributed-data-parallel/)：把训练脚本升级为支持**多张 GPU，并使用 DDP**。
+3. [第 3 章](./03-job-launchers/)：介绍如何在多节点集群上**启动训练任务**。
+4. [第 4 章](./04-fully-sharded-data-parallel/)：把训练脚本从 DDP 升级为 **FSDP**，以更合理地使用显存。
+5. [第 5 章](./05-training-llama-405b/)：把训练脚本升级为可以**训练 Llama-405B**。
+6. [第 6 章](./06-tensor-parallel/)：把单卡训练脚本升级为支持**张量并行**。
+7. [第 7 章](./07-2d-parallel/)：把张量并行脚本升级为 **2D 并行（FSDP + TP）**。
+8. [其他框架](./alternative-frameworks/)：介绍底层仍基于 PyTorch 的不同框架。
+9. [错误诊断](./diagnosing-errors/)：在集群中**快速诊断错误**的最佳实践和方法。
+10. [相关主题](./related-topics/)：做分布式训练时应该了解的主题。
 
+本指南回答的问题：
 
-Questions this guide answers:
+- 如何把单卡训练 / 微调脚本改成在多张 GPU 或多台机器上运行？
+- 训练过程中出现挂起或报错时，如何诊断？
+- 模型或优化器放不进单张 GPU，如何在集群上训练 / 微调？
+- 如何在集群上调度并启动训练？
+- 增加 worker 数量时，如何缩放超参数？
 
-- How do I update a single gpu training/fine tuning script to run on multiple GPUs or multiple nodes?
-- How do I diagnose hanging/errors that happen during training?
-- My model/optimizer is too big for a single gpu - how do I train/fine tune it on my cluster?
-- How do I schedule/launch training on a cluster?
-- How do I scale my hyperparameters when increasing the number of workers?
+其中也包含标准输出、标准错误以及 wandb 日志的最佳实践。在集群上诊断和调试训练时，日志至关重要。
 
-Best practices for logging stdout/stderr and wandb are also included, as logging is vitally important in diagnosing/debugging training runs on a cluster.
+每份训练脚本的目标都是训练一个因果语言模型（例如 GPT / Llama）。
 
-Each of the training scripts is aimed at training a causal language model (i.e. gpt/llama).
+## 环境准备
 
-## Set up
-
-### Clone this repo
+### 克隆仓库
 
 ```bash
 git clone https://github.com/LambdaLabsML/distributed-training-guide.git
 ```
 
-### Virtual Environment
+### 虚拟环境
 
 ```bash
 cd distributed-training-guide
@@ -59,12 +58,12 @@ pip install flash-attn --no-build-isolation
 
 ### wandb
 
-This tutorial uses `wandb` as an experiment tracker.
+本教程使用 `wandb` 作为实验跟踪工具。
 
 ```bash
 wandb login
 ```
 
 <p align="center">
-🦄 Other exciting ML projects at Lambda: <a href="https://news.lambda.ai/news/today">ML Times</a>, <a href="https://lambdalabsml.github.io/Open-Sora/introduction/">Text2Video</a>, <a href="https://lambdalabs.com/gpu-benchmarks">GPU Benchmark</a>.
+🦄 Lambda 的其他机器学习项目：<a href="https://news.lambda.ai/news/today">ML Times</a>、<a href="https://lambdalabsml.github.io/Open-Sora/introduction/">文生视频</a>、<a href="https://lambdalabs.com/gpu-benchmarks">GPU 基准测试</a>。
 </p>
