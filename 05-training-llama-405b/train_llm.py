@@ -67,12 +67,11 @@ def main():
     LOGGER.debug(f"Loading model from HF_HOME={os.getenv('HF_HOME')}")
 
     if args.cpu_offload:
-        # NOTE: the optimizer will run on CPU when using CPU offloading,
-        # so setting this will give us a little boost to that.
+        # 注意：使用 CPU 卸载时，优化器会在 CPU 上运行，
+        # 因此这样设置可以带来一点加速。
         torch.set_num_threads(os.cpu_count() // (torch.cuda.device_count()))
 
-    # Get the full state dict on rank 0 so we can broadcast it later
-    # with `set_model_state_dict()`
+    # 在 rank 0 上获取完整状态字典，稍后用 `set_model_state_dict()` 广播。
     if rank == 0:
         with torch.device("cpu"):
             full_model = AutoModelForCausalLM.from_pretrained(
@@ -84,7 +83,7 @@ def main():
         full_sd = {}
     dist.barrier()
 
-    # initialize model on meta device on **ALL** ranks
+    # 在**所有** rank 上用 meta 设备初始化模型。
     with rank0_first(), torch.device("meta"):
         config = AutoConfig.from_pretrained(args.model_name, use_cache=False)
         model = AutoModelForCausalLM.from_config(
@@ -96,7 +95,7 @@ def main():
         f"Training {sum(p.numel() for p in model.parameters())} model parameters"
     )
 
-    # shard the models - nothing surprising here.
+    # 给模型分片，这里没有意外之处。
     fsdp_config = dict(
         offload_policy=CPUOffloadPolicy() if args.cpu_offload else None,
         mp_policy=MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=torch.float32),
@@ -110,11 +109,11 @@ def main():
     LOGGER.info(
         "Transferred model to device. Will now broadcast weights from rank 0..."
     )
-    # Once we've sharded the meta model, we can allocate the tensors
-    # and then load the model weights using the full_sd from rank 0
-    # NOTE that the model here is the same on ALL ranks (even rank 0).
-    # You might expect model on rank 0 to hold the weights,
-    # but that is not what the API expects.
+    # 给 meta 模型分片后，就可以分配张量，
+    # 然后使用 rank 0 的 full_sd 加载模型权重。
+    # 注意：这里所有 rank（包括 rank 0）上的模型都相同。
+    # 你可能会以为 rank 0 上的模型持有权重，
+    # 但这不是该 API 的预期。
     set_model_state_dict(
         model=model,
         model_state_dict=full_sd,
@@ -125,9 +124,9 @@ def main():
         ),
     )
 
-    # unfortunately `full_model.state_dict()`` won't contain
-    # non-persistent buffers (i.e. `self.register_buffer(..., persistent=False)`),
-    # so we have to manually broadcast them from `full_model` ourselves
+    # 可惜 `full_model.state_dict()` 不包含非持久 buffer
+    # （即 `self.register_buffer(..., persistent=False)`），
+    # 因此必须手动从 `full_model` 广播它们。
     if rank == 0:
         for weight, buffer in zip(full_model.buffers(), model.buffers()):
             buffer.copy_(weight)
@@ -139,7 +138,7 @@ def main():
             buffer.copy_(device_buffer.to(buffer.device))
 
     del full_sd
-    # convienient way to force deallocation a model
+    # 强制释放模型的简便方法。
     if rank == 0:
         full_model.to(torch.device("meta"))
     del full_model
@@ -160,8 +159,8 @@ def main():
                 [decoders[i - j] for j in range(1, num_prefetch + 1) if i - j >= 0]
             )
 
-    # Applying gradient checkpointing - note that only the LlamaDecoderLayer supports this,
-    # so we can just reuse our existing wrap_policy.
+    # 应用梯度检查点。注意只有 LlamaDecoderLayer 支持它，
+    # 因此可以直接复用现有的 wrap_policy。
     if args.checkpoint_activations:
         from torch.nn import Embedding
         from transformers.models.llama.modeling_llama import LlamaDecoderLayer
@@ -177,8 +176,8 @@ def main():
         )
         LOGGER.info("Applied gradient checkpoint")
 
-    # NOTE: since this can download data, make sure to do the main process first on each node
-    # since we manually specified HF_HOME to be a node local drive.
+    # 注意：这里可能会下载数据，因此要让每个节点上的主进程先执行，
+    # 因为我们手动把 HF_HOME 指定为节点本地磁盘。
     with rank0_first():
         train_data = _load_and_preprocess_data(args, config)
     LOGGER.debug(f"{len(train_data)} training samples")
@@ -189,7 +188,7 @@ def main():
         collate_fn=default_data_collator,
         num_workers=1,
         prefetch_factor=2,
-        # NOTE: this sampler will split dataset evenly across workers
+        # 注意：这个 sampler 会把数据集均匀分给各个 worker。
         sampler=DistributedSampler(train_data, shuffle=True, drop_last=True),
     )
     LOGGER.debug(f"{len(dataloader)} batches per epoch")
@@ -210,10 +209,10 @@ def main():
         is_experiment = True
         exp_dir = exp_dir / args.experiment_name
 
-    # NOTE: full_state_dict=False means we will be saving sharded checkpoints.
+    # 注意：full_state_dict=False 表示保存分片检查点。
     ckpt_opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
 
-    # attempt resume
+    # 尝试恢复训练。
     state = {
         "epoch": 0,
         "global_step": 0,
@@ -269,7 +268,7 @@ def main():
         batches = iter(dataloader)
 
         for i_step in range(len(dataloader)):
-            # NOTE: prefetches the first layer
+            # 注意：预取第一层。
             model.unshard()
 
             with timers["data"], torch.no_grad():
@@ -277,7 +276,7 @@ def main():
                 batch = {k: v.to(device=device) for k, v in batch.items()}
 
             if i_step < state["epoch_step"]:
-                # NOTE: for resuming
+                # 注意：用于恢复训练。
                 continue
 
             with timers["forward"]:
@@ -327,7 +326,7 @@ def main():
             if is_experiment and state["global_step"] % args.ckpt_freq == 0:
                 LOGGER.info("Saving checkpoint.")
                 dist.barrier()
-                # NOTE: we have to call this on ALL ranks
+                # 注意：必须在所有 rank 上调用。
                 sharded_model_state, sharded_optimizer_state = get_state_dict(
                     model, optimizer, options=ckpt_opts
                 )
@@ -372,16 +371,16 @@ def _load_and_preprocess_data(args, config):
     if seq_length > config.max_position_embeddings:
         seq_length = min(1024, config.max_position_embeddings)
 
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
+    # 主要的数据处理函数：拼接数据集中的全部文本，并按 seq_length 切分文本块。
     def group_texts(examples):
-        # Concatenate all texts.
+        # 拼接全部文本。
         concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
         total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
-        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
+        # 总长度超过 seq_length 时，截去不足整块的尾部；正长度不足一块时，当前实现仍保留短块。
+        # 如果模型支持填充，也可以改成填充，而不是丢弃；这部分可以按需要自定义。
         if total_length > seq_length:
             total_length = (total_length // seq_length) * seq_length
-        # Split by chunks of max_len.
+        # 按 seq_length 切成块。
         result = {
             k: [t[i : i + seq_length] for i in range(0, total_length, seq_length)]
             for k, t in concatenated_examples.items()

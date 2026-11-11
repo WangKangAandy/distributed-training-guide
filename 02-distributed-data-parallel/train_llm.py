@@ -52,7 +52,7 @@ def main():
     dtype = torch.bfloat16
     torch.manual_seed(args.seed)
 
-    # NOTE: assumes $HF_HOME is shared storage
+    # 注意：假设 $HF_HOME 是共享存储。
     with rank0_first(), device:
         config = AutoConfig.from_pretrained(args.model_name, use_cache=False)
         model = AutoModelForCausalLM.from_config(config, dtype=dtype)
@@ -68,7 +68,7 @@ def main():
     )
     LOGGER.info(f"After DDP: model uses {get_mem_stats(device)['curr_alloc_gb']}gb")
 
-    # NOTE: Assumes that $HF_HOME is shared storage
+    # 注意：假设 $HF_HOME 是共享存储。
     with rank0_first():
         train_data = _load_and_preprocess_data(args, config)
     LOGGER.debug(f"{len(train_data)} training samples")
@@ -79,7 +79,7 @@ def main():
         collate_fn=default_data_collator,
         num_workers=1,
         prefetch_factor=2,
-        # NOTE: this sampler will split dataset evenly across workers
+        # 注意：这个 sampler 会把数据集均匀分给各个 worker。
         sampler=DistributedSampler(train_data, shuffle=True, drop_last=True),
     )
     LOGGER.debug(f"{len(dataloader)} batches per epoch")
@@ -97,7 +97,7 @@ def main():
         is_experiment = True
         exp_dir = exp_dir / args.experiment_name
 
-    # attempt resume
+    # 尝试恢复训练。
     state = {
         "epoch": 0,
         "global_step": 0,
@@ -133,7 +133,7 @@ def main():
         if state["epoch_step"] > 0:
             progress_bar.update(state["epoch_step"])
 
-        # We need to do this so we shuffle differently on each epoch in a reproducible way.
+        # 每个 epoch 都需要这样做，才能以可复现的方式使用不同的打乱顺序。
         dataloader.sampler.set_epoch(state["epoch"])
         batches = iter(dataloader)
 
@@ -143,12 +143,12 @@ def main():
                 batch = {k: v.to(device=device) for k, v in batch.items()}
 
             if i_step < state["epoch_step"]:
-                # NOTE: for resuming
+                # 注意：用于恢复训练。
                 continue
 
             with timers["forward"]:
                 outputs = model(**batch)
-                del batch  # NOTE: to save memory for backwards pass
+                del batch  # 注意：为反向传播腾出显存。
 
             with timers["backward"]:
                 outputs.loss.backward()
@@ -229,16 +229,16 @@ def _load_and_preprocess_data(args, config):
     if seq_length > config.max_position_embeddings:
         seq_length = min(1024, config.max_position_embeddings)
 
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
+    # 主要的数据处理函数：拼接数据集中的全部文本，并按 seq_length 切分文本块。
     def group_texts(examples):
-        # Concatenate all texts.
+        # 拼接全部文本。
         concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
         total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
-        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
+        # 总长度超过 seq_length 时，截去不足整块的尾部；正长度不足一块时，当前实现仍保留短块。
+        # 如果模型支持填充，也可以改成填充，而不是丢弃；这部分可以按需要自定义。
         if total_length > seq_length:
             total_length = (total_length // seq_length) * seq_length
-        # Split by chunks of max_len.
+        # 按 seq_length 切成块。
         result = {
             k: [t[i : i + seq_length] for i in range(0, total_length, seq_length)]
             for k, t in concatenated_examples.items()

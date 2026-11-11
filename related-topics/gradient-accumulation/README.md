@@ -1,14 +1,16 @@
-# Gradient Accumulation
+# 梯度累积
 
-Gradient accumulation is a way to increase the effective batch sizes of your model updates.
+梯度累积是一种增大模型更新有效 batch size 的方法。
 
-It is normally applied when your model is so big that you use a lower batch size when running the forward/backward pass.
+通常在模型很大、前向和反向必须使用较小 batch size 时使用它。
 
-If on a single GPU you have a batch size of 4, and a gradient accumulation of 2, then your effective batch size is 8. 
+如果单张 GPU 的 batch size 是 4，梯度累积步数是 2，那么有效 batch size 是 8。
 
-However, applying gradient accumulation in a standard way will cause slowdowns in distributed training setting because of gradient synchronization.
+但是，以标准方式应用梯度累积会在分布式训练中造成变慢，因为梯度需要同步。
 
-## Standard Implementation
+> 译注：以下保留原文的简化示意，假定 `i_step` 从 **1** 开始，且每组恰有 `grad_accum` 个 microbatch。若步号从 0 开始，应使用 `(i_step + 1) % grad_accum`；循环开始前要清空梯度。若要匹配大 batch 的平均梯度，等大小、等权重 microbatch 应先将 loss 除以 `grad_accum`。最后不足一组时需显式更新，并按实际样本数或有效 token 数正确加权。原示例未展示这些细节，不能直接视为完整训练循环。
+
+## 标准实现
 
 ```python
 outputs = model(**batch)
@@ -19,11 +21,13 @@ if i_step % grad_accum == 0:
     optimizer.zero_grad(set_to_none=True)
 ```
 
-## DataDistributedParalell Implementation
+## DistributedDataParallel 实现
 
-In a distributed setting, gradients will be synchronized at multiple points during our forward pass. It turns out we need to delay this synchronization until we do the full model step!
+在默认 DDP 中，每次反向传播都会触发梯度同步。累积期间可以跳过中间 microbatch 的梯度同步，在本轮累积的最后一次反向传播时同步，再更新参数。
 
-We can use [torch.nn.parallel.DistributedDataParallel.no_sync](https://pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html#torch.nn.parallel.DistributedDataParallel.no_sync) for this:
+> 译注：原文写成“前向期间同步梯度”，这里改为反向传播的梯度归约。`no_sync()` 必须同时包住前向和反向；前向仍可能涉及 buffer 广播等其他通信。
+
+可以使用 [torch.nn.parallel.DistributedDataParallel.no_sync](https://pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html#torch.nn.parallel.DistributedDataParallel.no_sync)：
 
 ```python
 from contextlib import nullcontext

@@ -1,8 +1,8 @@
-# Multi GPU on a single node
+# 单节点多 GPU
 
-**NOTE: This chapter's code builds off of [chapter 1](../01-single-gpu).**
+**注意：本章代码基于[第 1 章](../01-single-gpu)。**
 
-Single node command:
+单节点命令：
 
 ```bash
 cd distributed-training-guide/02-distributed-data-parallel
@@ -17,69 +17,72 @@ torchrun \
     -m openai-community/gpt2
 ```
 
-For multi node, see our [chapter on job launchers](../03-job-launchers/).
+多节点请看[任务启动器一章](../03-job-launchers/)。
 
-Quick jump:
-- [How Distributed Training works](#how-distributed-training-works)
-- [Using torchrun](#using-torchrun-instead-of-python)
-- [Code Changes](#code-changes)
-    - [Calling dist.init_process_group() and torch.cuda.set_device()](#calling-distinit_process_group-and-torchcudaset_device)
-    - [Including rank in logging statements](#including-rank-in-logging-statements)
-    - [DistributedDataParallel (DDP)](#using-distributeddataparallel)
+快速跳转：
+- [分布式训练如何工作](#how-distributed-training-works)
+- [使用 torchrun](#using-torchrun-instead-of-python)
+- [代码改动](#code-changes)
+    - [调用 dist.init_process_group() 和 torch.cuda.set_device()](#calling-distinit_process_group-and-torchcudaset_device)
+    - [在日志中包含 rank](#including-rank-in-logging-statements)
+    - [DistributedDataParallel（DDP）](#using-distributeddataparallel)
     - [DistributedSampler](#using-distributedsampler)
-    - I/O related guards
-        - [Downloading model/data in rank 0 first](#downloading-model--data-in-rank-0-first)
-        - [Interacting with file system on rank 0 only](#only-creating-experiment-directory-on-rank-0)
-        - [Checkpoints from rank 0 only](#save-checkpoint-on-rank-0)
-- [Optimizing memory - Zero Redundancy](#optimizing-memory---zero-redundancy-optimizer)
-- [How multi node works](#how-multi-node-works)
-- [Shared storage - Managing your python virtual environment across nodes](#shared-storage---managing-your-python-virtual-environment-across-nodes)
-- [Shared storage - Mangaging your dataset/model checkpoints across nodes](#shared-storage---mangaging-your-datasetmodel-checkpoints-across-nodes)
-- [`$HF_HOME` - The downloaded Model/Dataset directory](#hf_home---the-downloaded-modeldataset-directory)
+    - 与 I/O 相关的保护
+        - [先由 rank 0 下载模型和数据](#downloading-model--data-in-rank-0-first)
+        - [只在 rank 0 操作文件系统](#only-creating-experiment-directory-on-rank-0)
+        - [只由 rank 0 保存检查点](#save-checkpoint-on-rank-0)
+- [优化显存：Zero Redundancy](#optimizing-memory---zero-redundancy-optimizer)
+- [多节点如何工作](#how-multi-node-works)
+- [共享存储：在节点之间管理 Python 虚拟环境](#shared-storage---managing-your-python-virtual-environment-across-nodes)
+- [共享存储：在节点之间管理数据集和模型检查点](#shared-storage---mangaging-your-datasetmodel-checkpoints-across-nodes)
+- [`$HF_HOME`：已下载的模型与数据集目录](#hf_home---the-downloaded-modeldataset-directory)
 
-## Dictionary
+## 术语
 
-- `world size`: the total number of participating gpus
-- `rank` the global unique id of this worker (from `0` up to and including `world_size - 1`)
-- `local_rank` the rank local to this machine (from `0` up to and including `torch.cuda.device_count() - 1`)
+- `world size`：参与训练的 GPU 总数。
+- `rank`：这个 worker 的全局唯一编号，范围是 `0` 到 `world_size - 1`（含两端）。
+- `local_rank`：这台机器内部的编号，范围是 `0` 到 `torch.cuda.device_count() - 1`（含两端）。
 
-## How Distributed Training works
+## <a id="how-distributed-training-works"></a>分布式训练如何工作
 
-Before we get into the changes required to do distributed training, let's think a little bit. If you've ever done parallel computations before, you know one way to achieve parallelization is to simply split your workload over all your cores. This is really useful if your task is relatively the same for all of the things you want to process. In fact, this is how python's multiprocessing.Pool.map object works.
+在讲分布式训练需要改什么之前，先想一下原理。做过并行计算的话就会知道，一种并行方式是把工作量分到所有核心上。当每份待处理任务大体相同时，这非常有效。Python 的 `multiprocessing.Pool.map` 就是这样做的。
 
-Well distributed training with a GPU actually works the same way - we are splitting our workload (which is the batches from our dataset) over multiple GPUs. However we have an additional problem: how do we ensure that the model on all of our GPUs is the same?
+GPU 上的分布式训练其实一样：我们把工作量（数据集中的 batch）分到多张 GPU。但还多一个问题：如何保证所有 GPU 上的模型相同？
 
-We can actually achieve this in a very clever way. For sake of simplicity let's assume:
-1. Our model and optimizer fully fit on every GPU
-2. We initialize our model the exact same way on all of our GPUs
-3. Our optimizer has the exact same settings on all of our GPUs
+可以用一种很巧妙的方式做到。为了简化，假设：
 
-Now let's focus on our training loop. The canonical one in pytorch is:
+1. 模型和优化器都能完整放进每张 GPU。
+2. 所有 GPU 上的模型初始化方式完全相同。
+3. 所有 GPU 上的优化器设置完全相同。
+
+现在看训练循环。PyTorch 中典型写法是：
 
 ```python
-loss = model(**batch) # 1. Forward pass asynchronously
-optimizer.zero_grad() # 2. Reset gradients asynchronously
-loss.backward()       # 3. calculates gradients asynchronously
-optimizer.step()      # 4. synchronize gradients & update weights
+outputs = model(**batch) # 1. 前向计算
+optimizer.zero_grad()    # 2. 清空梯度
+outputs.loss.backward()  # 3. 计算梯度，DDP hooks 触发梯度归约
+optimizer.step()         # 4. 各 rank 使用同步后的梯度更新权重
 ```
 
-The first 3 lines of the above can all be done asychronously. `loss.backward()` will compute gradients in each of our training processes. The clever bit is that `optimizer.step()` will synchronize the gradients across all processes before actually updating the model parameters.
+`backward()` 在各训练进程中计算梯度，DDP 通过 autograd hooks 发起梯度归约，并尽可能让通信与反向计算重叠。随后，各 rank 的 `optimizer.step()` 使用已同步的梯度在本地更新参数。
 
-Here is a high level depiction of how a single step of training works when using this data parallel technique:
+> 译注：原文将梯度同步归因于 `optimizer.step()`，这里依据 [PyTorch DDP 设计说明](https://docs.pytorch.org/docs/stable/notes/ddp.html)予以纠正。示例也按本仓库 Transformers 模型的返回值使用 `outputs.loss`。
+
+下面是使用这种数据并行时，一个训练步骤的高层示意图：
 
 <img width="800" alt="image" src="https://github.com/user-attachments/assets/a988f513-a5b3-4e5f-bf0d-019e796ee4e0" />
 
-So to be explicit: **`optimizer.step()` is a synchronization point across ALL processes**.
+明确地说：**默认 DDP 的梯度同步发生在反向传播过程中，而不是由 `optimizer.step()` 发起**。图中的同步应理解为发生在参数更新之前。
 
-So how does pytorch achieve this?
+PyTorch 如何实现这一点？
 
-1. [Running N copies of our training script with torchrun.](#using-torchrun-instead-of-python)
-2. [Splitting data across our workers with DistributedSampler](#using-distributedsampler)
-3. [Synchronizing our gradients with DistributedDataParallel](#using-distributeddataparallel)
+1. [用 torchrun 运行训练脚本的 N 个副本。](#using-torchrun-instead-of-python)
+2. [用 DistributedSampler 在 worker 之间切分数据。](#using-distributedsampler)
+3. [用 DistributedDataParallel 同步梯度。](#using-distributeddataparallel)
 
-## Using `torchrun` instead of `python`
+## <a id="using-torchrun-instead-of-python"></a>用 `torchrun` 代替 `python`
 
-When we use `torchrun` to launch a distributed training job, what's happening is that it is **launch N separate processes** (where N is the number of gpus you specify in `--nproc-per-node`), all running your same training script:
+用 `torchrun` 启动分布式训练时，它会**启动 N 个独立进程**（N 是 `--nproc-per-node` 指定的 GPU 数量），每个进程都运行同一份训练脚本：
 
 ```
 > torchrun --nproc-per-node 3 train_llm.py ...
@@ -88,24 +91,25 @@ Launches subproc `$RANK=1 $WORLD_SIZE=3 train_llm.py ...`
 Launches subproc `$RANK=2 $WORLD_SIZE=3 train_llm.py ...`
 ```
 
-It will also set up some synchronization between the processes. Then each of the processes is running the same training code and needs to synchronize at various points. Each of the processes gets an id (the `rank`), which will tell it what device to use.
+它还会在进程之间建立同步。之后每个进程都运行相同的训练代码，并需要在若干位置同步。每个进程获得一个编号（`rank`），用来决定使用哪张设备。
 
-When running on multiple nodes, you need to run torchrun on every machine, but other than that it works exactly the same. See our [job launchers chapter](../03-job-launchers/) for how to do this.
+在多节点上运行时，每台机器都要运行 `torchrun`，除此之外完全相同。具体做法见[任务启动器一章](../03-job-launchers/)。
 
-Here are some of the common CLI arguments to torchrun used throughout this guide:
-- `--standalone` argument is used when only running on a single node.
-- `--nnodes` is the number of nodes we are using, in this case 1, but once we go to multiple nodes, this will be > 1.
-- `--nproc-per-node` is the number of processes. `gpu` means to use all available GPUs.
-- `--redirects 3` redirects the stdout & stderr into files
-- `--log-dir ../logs` configures the log directory
+本指南常用的 `torchrun` 命令行参数：
+
+- `--standalone`：只在单节点运行时使用。
+- `--nnodes`：使用的节点数。这里是 1；进入多节点后会大于 1。
+- `--nproc-per-node`：进程数。`gpu` 表示使用全部可用 GPU。
+- `--redirects 3`：把标准输出和标准错误重定向到文件。
+- `--log-dir ../logs`：设置日志目录。
 
 #### TORCHELASTIC_ERROR_FILE
 
-**Very important to include this for debugging!**
+**调试时一定要设置它！**
 
-When one of the workers (including a thread from a worker process) has an error, torchrun will save the error to the filepath controlled by this environment variable.
+某个 worker（包括 worker 进程中的线程）出错时，`torchrun` 会把错误保存到这个环境变量指定的文件。
 
-You also need to add a `@record` (imported `from torch.distributed.elastic.multiprocessing.errors import record`) annotation to your main function:
+还要给 `main` 函数加上 `@record`（从 `torch.distributed.elastic.multiprocessing.errors` 导入 `record`）：
 
 ```diff
 +@record
@@ -114,18 +118,17 @@ You also need to add a `@record` (imported `from torch.distributed.elastic.multi
 
 #### OMP_NUM_THREADS
 
-pytorch by default tries to take advantage of all the cores available when doing computations, even when you are on the GPU. Since we have multiple processes running pytorch, if we didn't set `OMP_NUM_THREADS` to something else, all of them would try to use all available cores.
+即使计算发生在 GPU 上，PyTorch 默认也会尽量使用所有可用 CPU 核心。现在有多个进程在运行 PyTorch，如果不把 `OMP_NUM_THREADS` 改成其他值，每个进程都会试图占用全部核心。
 
-You can manually check how many available cores there are and then split them accordingly. E.g. if there were 32 cores on a machine and 8 GPUs, you could set OMP_NUM_THREADS to 4.
+可以先查看可用核心数，再按进程分配。例如机器有 32 个核心、8 张 GPU，就可以把 `OMP_NUM_THREADS` 设为 4。
 
+## <a id="code-changes"></a>代码改动
 
-## Code Changes
+### <a id="calling-distinit_process_group-and-torchcudaset_device"></a>调用 `dist.init_process_group()` 和 `torch.cuda.set_device()`
 
-### Calling `dist.init_process_group()` and `torch.cuda.set_device()`
+调用其他 `dist` API 之前，这两个都必须先调用。
 
-You are required to call both of these before calling other dist apis.
-
-`dist.init_process_group()` will block until `WORLD_SIZE` processes have called it.
+`dist.init_process_group()` 会阻塞，直到 `WORLD_SIZE` 个进程都调用了它。
 
 ```diff
 +from torch import distributed as dist
@@ -145,11 +148,11 @@ You are required to call both of these before calling other dist apis.
 +   dist.init_process_group(rank=rank, world_size=world_size, device_id=device)
 ```
 
-If you don't call torch.cuda.set_device, processes may not be using the correct CUDA device.
+如果不调用 `torch.cuda.set_device`，进程可能不会使用正确的 CUDA 设备。
 
-### Including rank in logging statements
+### <a id="including-rank-in-logging-statements"></a>在日志中包含 rank
 
-This is a helpful thing to do to handle all the processes outputting to the same file, or even when you're browsing a single log file it's useful to have this on every log statement:
+所有进程可能写到同一个文件；即使只查看一份日志，每条记录带上 rank 也更方便：
 
 ```diff
  logging.basicConfig(
@@ -159,7 +162,7 @@ This is a helpful thing to do to handle all the processes outputting to the same
  )
 ```
 
-### Using DistributedDataParallel
+### <a id="using-distributeddataparallel"></a>使用 DistributedDataParallel
 
 ```diff
 +from torch.nn.parallel import DistributedDataParallel
@@ -170,23 +173,23 @@ This is a helpful thing to do to handle all the processes outputting to the same
 +model = DistributedDataParallel(model, device_ids=[local_rank])
 ```
 
-Funnily enough you might assume that the DDP module splits batches across processes, but that is not what it does at all!
+你可能会以为 DDP 模块负责把 batch 分给各个进程，其实完全不是。
 
-This is a model wrapper class that ensures **gradients are synchronized before calling optimizer.step()**. I encourage you to read the documentation for this, it's very informative: https://pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html.
+它是一个模型包装类，确保**调用 `optimizer.step()` 之前先同步梯度**。建议阅读文档，内容很有帮助：https://pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html。
 
-This class also ensures that *model parameters are equal when you construct it*!
+这个类还保证**构造时各进程的模型参数相同**。
 
-It achieves all of this through some [very special model hooks](https://github.com/pytorch/pytorch/blob/v2.4.1/torch/nn/parallel/distributed.py#L939) to sum all the gradients from all the ranks on all the ranks together:
+它通过一些[特殊的模型钩子](https://github.com/pytorch/pytorch/blob/v2.4.1/torch/nn/parallel/distributed.py#L939)，对所有 rank 的梯度进行归约；下面先除以进程数再求和，得到的是平均梯度：
 
 ```python
-# NOTE: internal pytorch code found at https://github.com/pytorch/pytorch/blob/v2.4.1/torch/nn/parallel/distributed.py#L939
+# 注意：以下为 PyTorch 内部代码，见 https://github.com/pytorch/pytorch/blob/v2.4.1/torch/nn/parallel/distributed.py#L939
 gradient = param.grad / self.process_group.size()
 gradient = fcol.all_reduce(gradient, "sum", self.process_group)
 ```
 
-### Using DistributedSampler
+### <a id="using-distributedsampler"></a>使用 DistributedSampler
 
-In our normal training script we use a `torch.utils.data.DataLoader` to batch our data. One of the arguments to DataLoader is a `sampler`, which basically samples items from the dataset when constructing the batches. You can think of the sampler as doing:
+普通训练脚本用 `torch.utils.data.DataLoader` 组 batch。DataLoader 的一个参数是 `sampler`，构造 batch 时从数据集中取样。可以把 sampler 理解成：
 
 ```python
 def simple_sampler():
@@ -194,7 +197,7 @@ def simple_sampler():
     return random.choice(range(worker_len))
 ```
 
-The clever thing that the DistributedSampler does is it partitions the length of the dataset across each of our workers. You don't even have to partition the actual dataset - it just chooses the integers that it returns from a specific subset of the dataset:
+DistributedSampler 的巧妙之处是按 worker 数量划分数据集长度。它甚至不需要真正切分数据集，只是从数据集的一个特定子集中选择要返回的整数：
 
 ```python
 def distributed_sampler():
@@ -202,7 +205,7 @@ def distributed_sampler():
     return dist.get_rank() * worker_len + random.choice(range(worker_len))
 ```
 
-Our code changes are very minimal for this to work!
+让它生效的代码改动非常少：
 
 ```diff
 +from torch.utils.data.distributed import DistributedSampler
@@ -217,7 +220,7 @@ Our code changes are very minimal for this to work!
  )
 ```
 
-You also need to call [DistributedSampler.set_epoch](https://pytorch.org/docs/stable/data.html#torch.utils.data.distributed.DistributedSampler). Here's the quote from the pytorch doc on this:
+还要调用 [DistributedSampler.set_epoch](https://pytorch.org/docs/stable/data.html#torch.utils.data.distributed.DistributedSampler)。PyTorch 文档的说明是：
 
 ```diff
  for state["epoch"] in range(state["epoch"], args.num_epochs):
@@ -225,17 +228,17 @@ You also need to call [DistributedSampler.set_epoch](https://pytorch.org/docs/st
      batches = iter(dataloader)
 ```
 
-> In distributed mode, calling the set_epoch() method at the beginning of each epoch before creating the DataLoader iterator is necessary to make shuffling work properly across multiple epochs. Otherwise, the same ordering will be always used.
+> 在分布式模式下，每个 epoch 开始、创建 DataLoader 迭代器之前必须调用 `set_epoch()`，多个 epoch 之间的打乱才能正常工作。否则会一直使用相同顺序。
 
-### Downloading model & data in rank 0 first
+### <a id="downloading-model--data-in-rank-0-first"></a>先由 rank 0 下载模型和数据
 
-This is mainly necessary because loading our data may download/preprocess some data and write to disk.
+这主要是因为加载数据时可能下载或预处理数据并写入磁盘。
 
-If we didn't do rank 0 first, all of our ranks may try to download the data at once, which will slow everything down.
+如果不让 rank 0 先做，所有 rank 可能同时下载，整体会变慢。
 
-**NOTE: A good best practice is to have your data already downloaded & preprocessed into a shared network drive**
+**注意：更好的做法是提前把数据下载并预处理到共享网络盘。**
 
-We can add a simple context manager to do this:
+可以用一个简单的上下文管理器：
 
 ```python
 @contextmanager
@@ -249,7 +252,7 @@ def rank0_first():
     dist.barrier()
 ```
 
-Downloading model weights & tokenizer:
+下载模型权重和分词器：
 
 ```diff
 +with rank0_first():
@@ -258,18 +261,18 @@ Downloading model weights & tokenizer:
          model = AutoModelForCausalLM.from_config(config, dtype=dtype)
 ```
 
-Downloading data:
+下载数据：
 
 ```diff
 +with rank0_first():
      train_data = _load_and_preprocess_data(args, tokenizer, config)
 ```
 
-### Only creating experiment directory on rank 0
+### <a id="only-creating-experiment-directory-on-rank-0"></a>只在 rank 0 创建实验目录
 
-Note the `dist.barrier()` calls before and after we create the directory. **These are very important!**
+注意创建目录前后的 `dist.barrier()`。**它们非常重要！**
 
-Since we check to see if the experiment directory already exists right before creating the experiment directory, we need to ensure that **all processes have checked for its existence**. So the first `dist.barrier()` call ensures that all workers have already checked the existence of that. Then and only then can we create the directory on rank 0.
+创建实验目录之前会检查目录是否已经存在，因此必须保证**所有进程都已经完成这次检查**。第一个 `dist.barrier()` 就是为了等所有 worker 检查完。只有这时，rank 0 才能创建目录。
 
 ```diff
 +if rank == 0:
@@ -277,9 +280,9 @@ Since we check to see if the experiment directory already exists right before cr
 +dist.barrier()
 ```
 
-### Save checkpoint on rank 0
+### <a id="save-checkpoint-on-rank-0"></a>只由 rank 0 保存检查点
 
-We only want one of our ranks to save a checkpoint. Otherwise the ranks might write to the same file and corrupt each other.
+只让一个 rank 保存检查点。否则多个 rank 可能写同一个文件并互相破坏。
 
 ```diff
  if state["global_step"] % args.ckpt_freq == 0:
@@ -292,9 +295,9 @@ We only want one of our ranks to save a checkpoint. Otherwise the ranks might wr
 +    dist.barrier()
 ```
 
-## Optimizing memory - Zero Redundancy Optimizer
+## <a id="optimizing-memory---zero-redundancy-optimizer"></a>优化显存：Zero Redundancy Optimizer
 
-DDP stores the entire model and optimizer on every single GPU. This is especially wasteful regarding the optimizer. Thankfully we have [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054) which we can easily add to reduce memory usage:
+DDP 在每张 GPU 上都保存完整模型和优化器。对优化器来说尤其浪费。好在可以直接加入 [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054) 来降低显存占用：
 
 ```diff
 + from torch.distributed.optim import ZeroRedundancyOptimizer
@@ -305,39 +308,40 @@ DDP stores the entire model and optimizer on every single GPU. This is especiall
 +)
 ```
 
-Unfortunately the code to save a state dict for ZeRO is exorbitantly slow, so we also have to remove saving the optimizer state dicts.
+可惜保存 ZeRO 状态字典的代码极其慢，所以还要去掉优化器状态字典的保存。
 
-## How multi node works
+## <a id="how-multi-node-works"></a>多节点如何工作
 
-It actually works in much the same way as the single node multi GPU. Since in the single node setting we have multiple processes, now we are just adding extra processes on different machines.
+它和单节点多 GPU 的工作方式基本相同。单节点时已经有多个进程，多节点只是把额外进程放到不同机器上。
 
-The main differences here to consider are:
-1. How to maintain the same environment on every node
-2. How the nodes get in contact with each other (the `rdzv` arguments in the torchrun command)
-3. How each node will access the data
+主要需要考虑：
 
-Error reporting/handling becomes extremely important with more than 1 node. Networking issues are very common, and there are some subtle things that you need to ensure are identical between the machines.
+1. 如何让每个节点保持相同环境。
+2. 节点之间如何互相发现（`torchrun` 命令中的 `rdzv` 参数）。
+3. 每个节点如何访问数据。
 
-## Shared storage - Managing your python virtual environment across nodes
+超过一个节点后，错误报告和处理变得极其重要。网络问题很常见，还必须保证机器之间的一些细微配置完全一致。
 
-For this the easiest approach is to create your python virtual environment in a shared network drive that all nodes can access. This way all of your nodes are using the exact same python executable/environment.
+## <a id="shared-storage---managing-your-python-virtual-environment-across-nodes"></a>共享存储：在节点之间管理 Python 虚拟环境
 
-Creating the virtual environment is the same as normal, you just want the directory to be shared.
+最简单的方法是把 Python 虚拟环境创建在所有节点都能访问的共享网络盘上。这样所有节点使用完全相同的 Python 可执行文件和环境。
 
-## Shared storage - Mangaging your dataset/model checkpoints across nodes
+创建方式和普通虚拟环境一样，只是目录必须共享。
 
-Again, the easiest approach here is to keep your data in a shared network drive. One thing to note is that shared network drives are slower to read from than node local drives. If you run into slowdowns in data loading, you can copy the data or model into node local storage.
+## <a id="shared-storage---mangaging-your-datasetmodel-checkpoints-across-nodes"></a>共享存储：在节点之间管理数据集和模型检查点
 
-When using `transformers` or `datasets`, make sure to set the `$HF_HOME` environment variable to control where huggingface downloads both datasets and model weights.
+同样，最简单的方法是把数据放在共享网络盘。需要注意，共享网络盘的读取通常比节点本地盘慢。如果数据加载变慢，可以把数据或模型复制到节点本地存储。
 
-## `$HF_HOME` - The downloaded Model/Dataset directory
+使用 `transformers` 或 `datasets` 时，设置 `$HF_HOME` 来控制 Hugging Face 下载数据集和模型权重的位置。
 
-Huggingface `transformers` and `datasets` library will download things to `$HF_HOME` by default. `$HF_HOME` defaults to a **node local** value. There are two options for you here:
+## <a id="hf_home---the-downloaded-modeldataset-directory"></a>`$HF_HOME`：已下载的模型与数据集目录
 
-1. Keep `$HF_HOME` as node local and change `with rank0_first()` to be `with local_rank0_first()`
-2. Change `$HF_HOME` to be a shared network drive
+Hugging Face 的 `transformers` 和 `datasets` 默认把内容下载到 `$HF_HOME`。`$HF_HOME` 的默认值是**节点本地**目录。这里有两个选择：
 
-A third option which requires code changes to the code in this repo would be to do this automatically in code:
+1. 保持 `$HF_HOME` 为节点本地，并把 `with rank0_first()` 改成 `with local_rank0_first()`。
+2. 把 `$HF_HOME` 改成共享网络盘。
+
+第三种选择需要修改本仓库代码，在代码里自动判断：
 
 ```python
 @contextmanager
@@ -349,14 +353,14 @@ def rank_ordered(first: bool):
         yield
     dist.barrier()
 
-# Determine if HF_HOME is node local or shared directory
+# 判断 HF_HOME 是节点本地目录还是共享目录
 hf_home_is_networked = os.path.ismount(os.environ["HF_HOME"])
 
 if hf_home_is_networked:
-    # We want rank 0 to go first (download will ONLY occur in rank 0) if directory is shared
+    # 目录共享时只让 rank 0 先执行，下载只发生在 rank 0
     should_go_first = rank == 0
 else:
-    # If directory is node local we want a SINGLE process on the node to download the data (local rank 0)
+    # 目录是节点本地时，让该节点上的一个进程下载（local rank 0）
     should_go_first = local_rank == 0
 
 with rank_ordered(should_go_first):

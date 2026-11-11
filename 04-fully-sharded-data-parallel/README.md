@@ -1,63 +1,66 @@
-# Sharding Across GPUs
+# 在 GPU 之间分片
 
-**NOTE: This chapter's code builds off of [chapter 2](../02-distributed-data-parallel/)'s code.**
+**注意：本章代码基于[第 2 章](../02-distributed-data-parallel/)的代码。**
 
-Up to this point we have assumed that both the model & optimizer fully fit on a single GPU. So each GPU during our training process fully contains a copy of the model and optimizer.
+到目前为止，我们都假设模型和优化器都能完整放进单张 GPU。因此训练时每张 GPU 都保存模型和优化器的完整副本。
 
-This becomes an issue once the model becomes big enough - either the model itself cannot fit, or the optimizer (which usually contains 1-4x the memory of the model) cannot fit anymore.
+模型变大后这会成为问题：要么模型本身放不下，要么优化器放不下。优化器占用的显存通常是模型的 1 到 4 倍。
 
-Sharding refers to spreading the **storage** of a combination of: optimizer state, gradients, and/or model parameters **across your GPUs**. **The execution of layers DOES NOT CHANGE**.
+分片（sharding）是把优化器状态、梯度和/或模型参数的**存储**分散到各张 GPU 上。**层的执行方式不会改变**。
 
-What this means:
+这意味着：
 
-1. Each layer of your model still needs to pull the **entire** layer's parameters/gradients/optimizer states into GPU memory. After the layer is done, then those pieces are resharded.
-2. There are synchronization costs to un-shard and re-shard before and after each layer.
-3. Sharding does not reduce the peak memory cost of your biggest layer.
+1. FSDP 单元执行前，需要通过 all-gather 收集该单元的**完整参数**；计算后按配置重新分片。反向传播通过 reduce-scatter 归约并分片梯度，优化器使用本地参数分片及对应状态更新。
 
-Sharding is a **data parallel** technique! **NOT** a model/tensor/pipeline parallel technique.
+   > 译注：原文把梯度和优化器状态也列为每层需要完整收集的对象，这不符合 [FSDP2 的工作方式](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html)。启用 CPU offload 时，优化器更新在 CPU 上执行。
+2. 每层前后的取消分片和重新分片都有同步成本。
+3. 分片不会降低最大一层的峰值显存占用。
 
-## PyTorch FullyShardedDataParallel (FSDP)
+分片是一种**数据并行**技术，**不是**模型并行、张量并行或流水线并行。
+
+## PyTorch FullyShardedDataParallel（FSDP）
 
 <img width="800" alt="image" src="https://github.com/user-attachments/assets/1c470f25-2e48-4786-9588-1b28bc42344b" />
 
-At a high level FSDP works as follow:
+从高层看，FSDP 的工作方式是：
 
-- In constructor:
-    - Shard model parameters and each rank only keeps its own shard
-- In forward path:
-    - Run all_gather to collect all shards from all ranks to recover the full parameter in this FSDP unit
-    - Run forward computation
-    - Discard parameter shards it has just collected
-- In backward path:
-    - Run all_gather to collect all shards from all ranks to recover the full parameter in this FSDP unit
-    - Run backward computation
-    - Run reduce_scatter to sync gradients
-    - Discard parameters.
+- 构造时：
+    - 分片模型参数，每个 rank 只保留自己的分片。
+- 前向路径：
+    - 执行 all_gather，从所有 rank 收集分片，恢复这个 FSDP 单元的完整参数。
+    - 执行前向计算。
+    - 丢弃刚刚收集到的参数分片。
+- 反向路径：
+    - 执行 all_gather，从所有 rank 收集分片，恢复这个 FSDP 单元的完整参数。
+    - 执行反向计算。
+    - 执行 reduce_scatter 同步梯度。
+    - 丢弃参数。
 
-Reference description of the process (from pytorch docs):
+PyTorch 文档中的流程说明：
 
 ![image](https://pytorch.org/assets/images/fsdp_workflow.png)
 
-References:
-- [FSDP Docs](https://pytorch.org/docs/stable/fsdp.html)
-- [FSDP Tutorial](https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html).
+参考资料：
 
-### Delayed initialization - the `meta` device
+- [FSDP 文档](https://pytorch.org/docs/stable/fsdp.html)
+- [FSDP 教程](https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html)
 
-[meta device docs](https://pytorch.org/docs/stable/meta.html)
+### 延迟初始化：`meta` 设备
 
-The meta device does not allocate any memory at all! It makes model initialization extremely fast. It's used for FSDP because we don't want to initialize weights until after the sharding happens.
+[meta 设备文档](https://pytorch.org/docs/stable/meta.html)
+
+meta 设备完全不分配内存，因此模型初始化极快。FSDP 使用它，是因为我们希望分片完成之后再初始化权重。
 
 ```python
 with torch.device("meta"):
     model = AutoModelForCausalLM.from_config(config, dtype=dtype)
 ```
 
-### Sharding the meta model
+### 给 meta 模型分片
 
-To do this we will the fsdp2 api from pytorch: [fully_shard()](https://docs.pytorch.org/docs/main/distributed.fsdp.fully_shard.html).
+这里使用 PyTorch 的 FSDP2 API：[fully_shard()](https://docs.pytorch.org/docs/main/distributed.fsdp.fully_shard.html)。
 
-This basically splits our model (still on the meta device) across all of our GPUs.
+它会把仍位于 meta 设备上的模型拆分到所有 GPU。
 
 ```python
 fsdp_config = dict(
@@ -69,33 +72,35 @@ for decoder in model.model.layers:
 fully_shard(model, **fsdp_config)
 ```
 
-An important note here is that we are applying sharding at the **decoder layer level**. What implications does this have?
+这里有一个重要细节：分片应用在**解码器层**这一级。这有什么影响？
 
-**`fully_shard()` inserts an all-gather where you put it**.
+**`fully_shard()` 会在你放置它的位置插入一次 all-gather。**
 
-So we are saying there should be an all-gather of each decoder layer right before it executes. If you want the all-gathers to happen at a different place, you will need to apply `fully_shard()` differently.
+因此，每个解码器层执行前都会对该层做一次 all-gather。如果希望 all-gather 发生在其他位置，就需要以不同方式调用 `fully_shard()`。
 
-#### When parameters are "resharded"
+#### 参数何时重新分片
 
-As the graphic at the top shows, typically parameters are resharded right after the forward pass completes. This is standard because it saves us more GPU memory through the forward pass.
+如顶部图所示，参数通常在前向结束后立即重新分片。这是标准做法，因为前向过程中可以节省更多 GPU 显存。
 
-If we set `reshard_after_forward=False`, we don't actually reshard things until after the backwards pass completes.
+如果设置 `reshard_after_forward=False`，则要等到反向传播结束后才重新分片。
 
-#### CPU Offload
+#### <a id="cpu-offload"></a>CPU 卸载
 
-From the [CPUOffloadPolicy docs](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html#torch.distributed.fsdp.CPUOffloadPolicy):
+摘自 [CPUOffloadPolicy 文档](https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html#torch.distributed.fsdp.CPUOffloadPolicy)：
 
-> This offload policy offloads parameters, gradients, and optimizer states to CPU.
+> 这个卸载策略会把参数、梯度和优化器状态卸载到 CPU。
 
-This option **heavily** reduces memory requirements - at the cost of a lot of compute and memory bandwidth. The forward & backward pass runs on the GPU, then gradients are offloaded to CPU and the optimizer runs on the CPU:
+这个选项会**大幅**降低显存需求，但代价是大量计算和内存带宽。前向和反向仍在 GPU 上运行，然后梯度被卸载到 CPU，优化器也在 CPU 上运行：
 
-> Sharded gradients are copied device-to-host in backward, and the **optimizer.step() runs on CPU** with CPU optimizer states.
+> 反向传播时，分片梯度会从设备复制到主机，并且 **`optimizer.step()` 在 CPU 上运行**，使用的是 CPU 上的优化器状态。
 
-Note that this option will **NOT reduce peak GPU memory requirements** - each layer will still be fully executed in the GPU. However there may be more memory for each layer to use as more memory is stored in the CPU.
+注意：CPU offload **不会消除单个 FSDP 单元计算时完整参数和中间激活的显存需求**。不过，常驻 GPU 的分片状态减少后，总峰值显存仍可能下降。
 
-### Initializing the model
+> 译注：原文“不会降低峰值 GPU 显存”的说法过于绝对；这里区分单层计算所需显存与整个训练过程的总峰值。
 
-First we allocate the memory with `to_empty` and then we reset all the parameters with the standard `reset_parameters()`
+### 初始化模型
+
+先用 `to_empty` 分配内存，再用标准的 `reset_parameters()` 重置所有参数：
 
 ```python
 model.to_empty(device="cpu" if args.cpu_offload else device)
@@ -104,7 +109,7 @@ model.apply(
 )
 ```
 
-Note that some modules like RotaryEmbedding have buffers and not parameters. These will get deallocated with `to_empty()` but not reset with `reset_parameters()`. You'll have to handle these manually:
+注意：RotaryEmbedding 等模块拥有的是 buffer 而不是 parameter。`to_empty()` 会释放它们，但 `reset_parameters()` 不会重置它们，必须手动处理：
 
 ```python
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
@@ -120,11 +125,11 @@ LlamaRMSNorm.reset_parameters = lambda self: torch.nn.init.ones_(self.weight)
 LlamaRotaryEmbedding.reset_parameters = reset_rope
 ```
 
-### Sharded Checkpoints
+### 分片检查点
 
-Since model parameters may be sharded across GPUs, we need to do checkpointing a little bit differently. The fastest and least memory intensive will be sharded checkpoints, which will just save whatever shard the GPU currently has. Sharded checkpoints are what we recommend.
+模型参数可能分布在多张 GPU 上，因此保存检查点的方式也要改变。最快、显存开销最低的是分片检查点：每张 GPU 只保存自己当前持有的分片。我们推荐使用分片检查点。
 
-Here are the imports you need to do this:
+需要的导入如下：
 
 ```python
 from torch.distributed.checkpoint.state_dict import (
@@ -135,23 +140,23 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint import load, save
 ```
 
-Additionally, we are going to set up our [StateDictOptions](https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.StateDictOptions), because it is used multiple places:
+另外要配置 [StateDictOptions](https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.StateDictOptions)，因为多处都会使用它：
 
 ```python
-# NOTE: full_state_dict=False means we will be saving sharded checkpoints.
+# NOTE: full_state_dict=False 表示保存分片检查点。
 ckpt_opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
 ```
 
-If we were to set `full_state_dict=True`, then we'd be doing full state dicts.
+如果设置 `full_state_dict=True`，保存的就是完整状态字典。
 
-#### Saving a sharded checkpoint
+#### 保存分片检查点
 
-A notable difference to normal checkpoint is that we have to **save on every rank**, because we are doing sharded checkpoints, we need all the shards from every rank.
+与普通检查点明显不同的是，**每个 rank 都必须保存**。因为这是分片检查点，需要收集每个 rank 的分片。
 
 ```python
 if state["global_step"] % args.ckpt_freq == 0:
     dist.barrier()
-    # NOTE: we have to call this on ALL ranks
+    # NOTE: 必须在所有 rank 上调用
     sharded_model_state, sharded_optimizer_state = get_state_dict(
         model, optimizer, options=ckpt_opts
     )
@@ -161,17 +166,17 @@ if state["global_step"] % args.ckpt_freq == 0:
     )
 ```
 
-[torch.distributed.checkpoint.state_dict.get_state_dict()](https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict) takes in a normal model/optimizer and extracts a state dict that contains the sharded checkpoints.
+[torch.distributed.checkpoint.state_dict.get_state_dict()](https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict) 接收普通模型和优化器，并提取包含分片检查点的状态字典。
 
-Then we just call [torch.distributed.checkpoint.state_dict_saver.save()](https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict_saver.save) to save this sharded checkpoint.
+然后调用 [torch.distributed.checkpoint.state_dict_saver.save()](https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict_saver.save) 保存这个分片检查点。
 
-After this runs, the directory you specify will contain a file per rank!
+运行结束后，指定目录中会为每个 rank 生成一个文件。
 
-#### Loading a sharded checkpoint
+#### 加载分片检查点
 
-Loading a sharded checkpoint is a little bit more complicated, since we have to convert back and forth between various formats for the checkpoints.
+加载分片检查点稍微复杂一些，因为需要在检查点的不同格式之间来回转换。
 
-First, we call [torch.distributed.checkpoint.state_dict.get_state_dict()](https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict), just like we did in saving a checkpoint. This will construct the sharded checkpoint dictionaries just like they were constructed when saving:
+首先，像保存时一样调用 [torch.distributed.checkpoint.state_dict.get_state_dict()](https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.get_state_dict)。它会按保存时的方式构造分片检查点字典：
 
 ```python
 sharded_model_state, sharded_optimizer_state = get_state_dict(
@@ -179,7 +184,7 @@ sharded_model_state, sharded_optimizer_state = get_state_dict(
 )
 ```
 
-Next we call the opposite of save, [torch.distributed.checkpoint.state_dict_loader.load()](https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict_loader.load). At this point the sharded state dicts will contain exactly what we saved earlier.
+接着调用与 save 相对的 [torch.distributed.checkpoint.state_dict_loader.load()](https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict_loader.load)。此时分片状态字典会包含之前保存的内容。
 
 ```python
 load(
@@ -188,7 +193,7 @@ load(
 )
 ```
 
-Finally, we need to apply these sharded checkpoint state dicts to the actual model parameters in our last step, with [torch.distributed.checkpoint.state_dict.set_state_dict()](https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.set_state_dict):
+最后，用 [torch.distributed.checkpoint.state_dict.set_state_dict()](https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.state_dict.set_state_dict) 把这些分片检查点应用到实际模型参数：
 
 ```python
 set_state_dict(
@@ -200,18 +205,18 @@ set_state_dict(
 )
 ```
 
-#### Converting a sharded checkpoint to a full state dict checkpoint
+#### 把分片检查点转换成完整状态字典检查点
 
-If you want to convert between formats (like sharded to full state dict), pytorch has a set of utilities for this already. Find the guide here:
+如果要在格式之间转换，例如从分片格式转换为完整状态字典，PyTorch 已经提供了相应工具。指南在这里：
 
 https://pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html#formats
 
-## Run Command
+## 运行命令
 
-Same command as normal:
+命令与平常相同：
 
 ```bash
-cd distributed-training-guide/04-sharding-fsdp
+cd distributed-training-guide/04-fully-sharded-data-parallel
 export TORCHELASTIC_ERROR_FILE=../error.json
 export OMP_NUM_THREADS=1
 export HF_HOME=../.cache

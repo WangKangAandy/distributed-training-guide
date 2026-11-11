@@ -1,20 +1,22 @@
-# Job Launchers
+# 任务启动器
 
-**NOTE: This chapter's code is identical to [chapter 2](../02-distributed-data-parallel/)'s code, so the command uses the training script from chapter 2.** If the job launcher requires code changes to work, the code changes will be called out.
+**注意：本章代码与[第 2 章](../02-distributed-data-parallel/)完全相同，因此命令使用第 2 章的训练脚本。** 如果某种启动器必须修改代码才能工作，文中会单独标出。
 
-Since it is quite cumbersome to manually SSH into every node and start a training job, there are various ways to launch distributed training jobs from a single node.
+> 译注：本章 MPI 和 DeepSpeed 小节要求的代码改动，应分别应用到第 2 章脚本或它的副本，再运行对应命令；以下路径修正并不表示未经修改的脚本支持所有启动器。
 
-Quick jump:
-- [Bash per node](#bash-commands-xargssshtmux)
+手动 SSH 到每台节点再启动训练很麻烦，所以有多种方法可以从一台节点启动分布式训练任务。
+
+快速跳转：
+- [每节点一条 Bash 命令](#bash-commands-xargssshtmux)
 - [slurm](#slurm)
 - [mpi](#mpirun)
 - [deepspeed](#deepspeed)
 
-## Bash Commands (xargs/ssh/tmux)
+## <a id="bash-commands-xargssshtmux"></a>Bash 命令（xargs/ssh/tmux）
 
-Since the main thing we need to do is spawn processes on other machines, we can combine a few bash tools together to achieve this. This approach is one of the most lightweight approaches for this, and makes it easy to edit the commands any way you want. While it takes a bit to understand how all the bash commands work together, they are generally applicable to other problems as well.
+我们主要需要在其他机器上创建进程，因此可以把几个 Bash 工具组合起来。这是最轻量的方法之一，也方便按需要修改命令。理解这些 Bash 命令如何配合需要一点时间，但它们也能用到其他问题上。
 
-Put your list of hostnames/IPs in a file called `hosts`. Each line represents a single node that we will launch `torchrun` on.
+把主机名或 IP 列表放进名为 `hosts` 的文件。每一行代表一台要启动 `torchrun` 的节点。
 
 ```
 <hostname 1>
@@ -23,7 +25,7 @@ Put your list of hostnames/IPs in a file called `hosts`. Each line represents a 
 <hostname n>
 ```
 
-Then we can use ssh to launch `torchrun` on each of the hosts. This command is very similar to our previous bash command, except we are using `torchrun` (`python -m torch.distributed.run`) instead of just invoking our python script.
+然后用 SSH 在每台主机上启动 `torchrun`。这条命令和前面的 Bash 命令很像，只是不再直接运行 Python 脚本，而是使用 `torchrun`（`python -m torch.distributed.run`）。
 
 ```bash
 cd distributed-training-guide/03-job-launchers
@@ -47,47 +49,49 @@ xargs -a hosts -I {} \
     --model-name openai-community/gpt2
 ```
 
-Monitoring the output:
+查看输出：
+
 ```bash
 find ../logs/ -name \*stderr.log | xargs tail -f
 ```
 
-Killing the job:
+停止任务：
+
 ```bash
 xargs -a hosts -I{} ssh {} tmux kill-session -t $JOB_NAME
 ```
 
-Here's how these work:
+这些部分的作用：
 
-1. `xargs -a hosts -I {}` reads the lines from the `hosts` file, and replaces `{}` in the command following with each line
-2. `ssh {} tmux new-session -d -s $JOB_NAME -c $(pwd)` creates a tmux session on each of the hosts in the hosts file
-    1. `-d` means detached, so we can spawn it without blocking
-    2. `-s $JOB_NAME` means the sessions will have the name of our job, meaning we can kill them easily.
-    3. `-c $(pwd)` means every process will have the working directory that we launch this command from
-    4. `-e <env variable name>=<value>` will set up an environment variable for the process we launch using tmux
+1. `xargs -a hosts -I {}` 读取 `hosts` 的每一行，并用该行替换后面命令中的 `{}`。
+2. `ssh {} tmux new-session -d -s $JOB_NAME -c $(pwd)` 在 `hosts` 中的每台主机上创建一个 tmux 会话。
+    1. `-d` 表示分离会话，因此创建时不会阻塞。
+    2. `-s $JOB_NAME` 用任务名命名会话，便于统一停止。
+    3. `-c $(pwd)` 让每个进程使用执行这条命令时所在的工作目录。
+    4. `-e <环境变量名>=<值>` 为 tmux 启动的进程设置环境变量。
 
-From there on we just paste our normal python command, note that we use `$(which python)` to get the absolute path to whatever interpreter executable we are using. 
+后面直接接上原来的 Python 命令。注意用 `$(which python)` 取得当前解释器可执行文件的绝对路径。
 
 ## slurm
 
-slurm is a very popular job scheduling software often used with clusters.
+slurm 是集群上非常常用的任务调度软件。
 
-Submit the training job using the provided `job.sbatch` script:
+用提供的 `job.sbatch` 脚本提交训练任务：
 
 ```bash
 cd distributed-training-guide/03-job-launchers
 sbatch --nodes 2 --gpus 16 --cpus-per-task 8 job.sbatch
 ```
 
-By default slurm assigns 1 task per node, which is great for us because we will invoke torchrun once per node.
+slurm 默认每个节点分配一个 task。这正好适合我们，因为每个节点只需调用一次 `torchrun`。
 
-The command above requests a total of 16 gpus from 2 nodes total.
+上面的命令总共向 2 个节点申请 16 张 GPU。
 
-### The slurm file
+### slurm 文件
 
-This is mostly identical to our torchrun command that we have been using thus far, just with various settings controlled by slurm.
+它和目前一直使用的 `torchrun` 命令基本相同，只是各项设置由 slurm 控制。
 
-The command listed below will be run on each node (since we have specified `--ntasks-per-node=1`).
+由于指定了 `--ntasks-per-node=1`，下面的命令会在每个节点上运行。
 
 ```bash
 # SBATCH --ntasks-per-node=1
@@ -118,11 +122,11 @@ srun torchrun \
 
 ## mpirun
 
-There are two main flavors of MPI implementation, OpenMPI and MPICH. Either of them will work and we will use the OpenMPI implementation in this blog. **You need to install OpenMPI**.
+MPI 主要有 OpenMPI 和 MPICH 两种实现。两者都可以，本文使用 OpenMPI。**需要先安装 OpenMPI。**
 
-### Code Changes
+### 代码改动
 
-Use MPI environment variables when initializing the process group:
+初始化进程组时使用 MPI 环境变量：
 
 ```diff
 -    dist.init_process_group()
@@ -132,7 +136,7 @@ Use MPI environment variables when initializing the process group:
 +    )
 ```
 
-### Command
+### 命令
 
 ```bash
 cd distributed-training-guide/03-job-launchers
@@ -147,35 +151,38 @@ mpirun \
     -map-by slot \
     -wdir $(pwd) \
     -output-filename ../logs/mpi-multi-node \
-    $(which python) train_llm.py \
+    $(which python) ../02-distributed-data-parallel/train_llm.py \
     --experiment-name mpi-multi-node \
     --dataset-name tatsu-lab/alpaca \
     --model-name openai-community/gpt2
 ```
 
-Arguments:
-- `-H` specifies the hosts we want to launch on AND the number of processes per host
-- `-x` sets up an environment variable in all the launched processes
-- `-wdir` sets up the working directory for the launched processes
-- `-bind-to none` specifies Open MPI to not bind a training process to a single CPU core (which would hurt performance).
-- `-map-by slot` allows you to have a mixture of different NUMA configurations because the default behavior is to bind to the socket.
+参数：
 
-Notes:
-- We have to specify `MASTER_ADDR` and `MASTER_PORT` for pytorch to know how to talk to each other
-- In our code we have to pass the rank and world size based on the `$OMPI_COMM_WORLD_RANK` and `$OMPI_COMM_WORLD_SIZE` environment variables.
-- We use `$(which python)` to get the absolute path of our python interpreter - if you are launch from a head node instead of a worker node, you'll need to change this.
+- `-H` 指定要启动的主机，以及每台主机上的进程数。
+- `-x` 给所有启动的进程设置环境变量。
+- `-wdir` 设置这些进程的工作目录。
+- `-bind-to none` 让 Open MPI 不要把训练进程绑定到单个 CPU 核心，否则会损害性能。
+- `-map-by slot` 允许混合不同的 NUMA 配置，因为默认行为是绑定到 socket。
+
+说明：
+
+- 必须指定 `MASTER_ADDR` 和 `MASTER_PORT`，PyTorch 才知道进程之间如何通信。
+- 代码中必须根据 `$OMPI_COMM_WORLD_RANK` 和 `$OMPI_COMM_WORLD_SIZE` 传入 rank 和 world size。
+- 用 `$(which python)` 获取 Python 解释器的绝对路径。如果从管理节点而不是 worker 节点启动，就需要修改这一项。
 
 ## deepspeed
 
-deepspeed is a distributed training library with many optimizations. We go into some of these optimizations in more detail in later chapters, but here we can just use the launcher included with it.
+deepspeed 是一个带有许多优化的分布式训练库。后面章节会更详细地介绍其中一些优化；这里只使用它自带的启动器。
 
-**NOTE: you do not have to integrate deepspeed into your training code to use the deepspeed launcher.**
+**注意：使用 deepspeed 启动器时，不必把 deepspeed 集成进训练代码。**
 
-Install: `pip install deepspeed`
+安装：`pip install deepspeed`
 
-### Code Changes
+### 代码改动
 
-Add `--local_rank` to cli parsing:
+在命令行解析中加入 `--local_rank`：
+
 ```diff
      parser.add_argument("--log-freq", default=10, type=int)
      parser.add_argument("--ckpt-freq", default=500, type=int)
@@ -183,13 +190,14 @@ Add `--local_rank` to cli parsing:
      return parser
 ```
 
-Use it when initializing local_rank:
+初始化 `local_rank` 时使用它：
+
 ```diff
 -    local_rank = rank % torch.cuda.device_count()
 +    local_rank = args.local_rank or (rank % torch.cuda.device_count())
 ```
 
-### Command
+### 命令
 
 ```bash
 cd distributed-training-guide/03-job-launchers
@@ -199,7 +207,7 @@ export OMP_NUM_THREADS=1
 deepspeed \
     --include <ip of node 1>@<ip of node 2> \
     --enable_each_rank_log ../logs \
-    train_llm.py \
+    ../02-distributed-data-parallel/train_llm.py \
     --experiment-name deepspeed-multi-node \
     --dataset-name tatsu-lab/alpaca \
     --model-name openai-community/gpt2

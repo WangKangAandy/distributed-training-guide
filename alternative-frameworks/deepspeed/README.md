@@ -1,26 +1,27 @@
 # DeepSpeed ZeRO
 
-Install deepspeed: `pip install deepspeed`
+安装 DeepSpeed：`pip install deepspeed`
 
 <img width="583" alt="image" src="https://github.com/user-attachments/assets/c2966a46-1807-4a56-92d4-977798087dd6">
 
-This is actually a collection of modes to shard more and more memory:
+它实际上是一组逐步分片更多内存的模式：
 
-> ZeRO Stage 1: The optimizer states (e.g., for Adam optimizer, 32-bit weights, and the first, and second moment estimates) are partitioned across the processes, so that each process updates only its partition.
+> ZeRO Stage 1：优化器状态（例如 Adam 优化器的 32 位权重，以及一阶矩和二阶矩估计）在进程之间划分，因此每个进程只更新自己的那一部分。
 
-> ZeRO Stage 2: The reduced 32-bit gradients for updating the model weights are also partitioned such that each process retains only the gradients corresponding to its portion of the optimizer states.
+> ZeRO Stage 2：用于更新模型权重的已归约 32 位梯度也被划分，每个进程只保留与自己那部分优化器状态对应的梯度。
 
-> ZeRO Stage 3: The 16-bit model parameters are partitioned across the processes. ZeRO-3 will automatically collect and partition them during the forward and backward passes.
+> ZeRO Stage 3：16 位模型参数在进程之间划分。ZeRO-3 会在前向和反向期间自动收集并重新划分它们。
 
-References:
-- [deepspeed docs](https://deepspeed.readthedocs.io/en/latest/zero3.html)
+参考资料：
+
+- [DeepSpeed 文档](https://deepspeed.readthedocs.io/en/latest/zero3.html)
 - [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054)
 - [ZeRO-Offload: Democratizing Billion-Scale Model Training](https://arxiv.org/abs/2101.06840)
 - [ZeRO-Infinity: Breaking the GPU Memory Wall for Extreme Scale Deep Learning](https://arxiv.org/abs/2104.07857)
 
-## Integrating DeepSpeed into training code
+## 把 DeepSpeed 集成进训练代码
 
-### Argument Parsing
+### 参数解析
 
 ```diff
 @@ -305,11 +302,10 @@ def _get_parser() -> argparse.ArgumentParser:
@@ -31,13 +32,14 @@ References:
      return parser
 ```
 
-### Initialization
+### 初始化
 
-Two main differences here:
-1. We call `deepspeed.init_distributed` instead of using pytorch's `init_process_group`
-2. We call `deepspeed.initialize` after we've constructed the model **instead** of wrapping the model with DDP.
+这里有两个主要区别：
 
-**NOTE**: `deepspeed.initialize` will construct the optimizer & lr_scheduler based on the config you pass in
+1. 调用 `deepspeed.init_distributed`，而不是使用 PyTorch 的 `init_process_group`。
+2. 构造模型后调用 `deepspeed.initialize`，**代替**用 DDP 包装模型。
+
+**注意**：`deepspeed.initialize` 会根据传入的配置构造优化器和学习率调度器。
 
 ```diff
 @@ -14,6 +14,7 @@ from torch.nn.parallel import DistributedDataParallel
@@ -82,9 +84,9 @@ Two main differences here:
      )
 ```
 
-### Train Loop
+### 训练循环
 
-Here we are just going to be replacing our pytorch calls with deepspeed calls. Note that we don't have direct access to optimizer/lr_scheduler anymore since deepspeed handles that.
+这里只是把 PyTorch 调用替换成 DeepSpeed 调用。注意，我们不再直接访问优化器和学习率调度器，因为 DeepSpeed 会处理它们。
 
 ```diff
              with timers["forward"]:
@@ -105,9 +107,9 @@ Here we are just going to be replacing our pytorch calls with deepspeed calls. N
              state["epoch_step"] += 1
 ```
 
-### Checkpoints
+### 检查点
 
-Loading becomes:
+加载变成：
 
 ```diff
      resumed = False
@@ -123,7 +125,7 @@ Loading becomes:
 +        resumed = load_path is not None
 ```
 
-Saving becomes: (**NOTE**: saving must be done on ALL ranks instead of just rank 0 - because of sharding)
+保存变成（**注意**：由于分片，必须在所有 rank 上保存，而不能只在 rank 0 上保存）：
 
 ```diff
              if state["global_step"] % args.ckpt_freq == 0:
@@ -137,7 +139,7 @@ Saving becomes: (**NOTE**: saving must be done on ALL ranks instead of just rank
                  dist.barrier()
 ```
 
-## Configuration
+## 配置
 
 ```json
 {
@@ -167,10 +169,10 @@ Saving becomes: (**NOTE**: saving must be done on ALL ranks instead of just rank
 }
 ```
 
-## Command
+## 命令
 
 ```bash
-cd distributed-training-guide/05-sharding-deepspeed
+cd distributed-training-guide/alternative-frameworks/deepspeed
 export TORCHELASTIC_ERROR_FILE=../error.json
 export OMP_NUM_THREADS=1
 export HF_HOME=../.cache

@@ -29,7 +29,7 @@ from transformers import (
     default_data_collator,
 )
 
-# fixes for reset_parameters not existing
+# 修复不存在 reset_parameters 的情况。
 from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaRotaryEmbedding
 
 
@@ -71,7 +71,7 @@ def main():
     dtype = torch.bfloat16
     torch.manual_seed(args.seed)
 
-    # NOTE: meta device will not allocate any memory
+    # 注意：meta 设备不会分配任何内存。
     model: torch.nn.Module
     with rank0_first(), torch.device("meta"):
         config = AutoConfig.from_pretrained(args.model_name, use_cache=False)
@@ -95,8 +95,8 @@ def main():
     )
     LOGGER.info(f"Initialized model uses {get_mem_stats(device)['curr_alloc_gb']}gb")
 
-    # NOTE: since this can download data, make sure to do the main process first
-    # NOTE: This assumes that the data is on a **shared** network drive, accessible to all processes
+    # 注意：这里可能会下载数据，因此要让主进程先执行。
+    # 注意：这里假设数据位于所有进程都能访问的**共享**网络盘。
     with rank0_first():
         train_data = _load_and_preprocess_data(args, config)
     LOGGER.debug(f"{len(train_data)} training samples")
@@ -105,7 +105,7 @@ def main():
         train_data,
         batch_size=args.batch_size,
         collate_fn=default_data_collator,
-        # NOTE: this sampler will split dataset evenly across workers
+        # 注意：这个 sampler 会把数据集均匀分给各个 worker。
         sampler=DistributedSampler(train_data, shuffle=True, drop_last=True),
     )
     LOGGER.debug(f"{len(dataloader)} batches per epoch")
@@ -121,10 +121,10 @@ def main():
         is_experiment = True
         exp_dir = exp_dir / args.experiment_name
 
-    # NOTE: full_state_dict=False means we will be saving sharded checkpoints.
+    # 注意：full_state_dict=False 表示保存分片检查点。
     ckpt_opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
 
-    # attempt resume
+    # 尝试恢复训练。
     state = {
         "epoch": 0,
         "global_step": 0,
@@ -184,7 +184,7 @@ def main():
         batches = iter(dataloader)
 
         for i_step in range(len(dataloader)):
-            # NOTE: prefetches the first layer
+            # 注意：预取第一层。
             model.unshard()
 
             with timers["data"], torch.no_grad():
@@ -192,7 +192,7 @@ def main():
                 batch = {k: v.to(device=device) for k, v in batch.items()}
 
             if i_step < state["epoch_step"]:
-                # NOTE: for resuming
+                # 注意：用于恢复训练。
                 continue
 
             with timers["forward"]:
@@ -240,7 +240,7 @@ def main():
 
             if is_experiment and state["global_step"] % args.ckpt_freq == 0:
                 dist.barrier()
-                # NOTE: we have to call this on ALL ranks
+                # 注意：必须在所有 rank 上调用。
                 sharded_model_state, sharded_optimizer_state = get_state_dict(
                     model, optimizer, options=ckpt_opts
                 )
@@ -287,16 +287,16 @@ def _load_and_preprocess_data(args, config):
     if seq_length > config.max_position_embeddings:
         seq_length = min(1024, config.max_position_embeddings)
 
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
+    # 主要的数据处理函数：拼接数据集中的全部文本，并按 seq_length 切分文本块。
     def group_texts(examples):
-        # Concatenate all texts.
+        # 拼接全部文本。
         concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
         total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
-        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
+        # 总长度超过 seq_length 时，截去不足整块的尾部；正长度不足一块时，当前实现仍保留短块。
+        # 如果模型支持填充，也可以改成填充，而不是丢弃；这部分可以按需要自定义。
         if total_length > seq_length:
             total_length = (total_length // seq_length) * seq_length
-        # Split by chunks of max_len.
+        # 按 seq_length 切成块。
         result = {
             k: [t[i : i + seq_length] for i in range(0, total_length, seq_length)]
             for k, t in concatenated_examples.items()

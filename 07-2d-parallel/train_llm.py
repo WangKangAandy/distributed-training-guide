@@ -84,9 +84,9 @@ def main():
             layer,
             mesh["tp"],
             {
-                # SequenceParallel will apply sharding to sequence dimension.
+                # SequenceParallel 会沿序列维度分片。
                 "input_layernorm": tp.SequenceParallel(),
-                # The input to self_attn (which is the output from the SequenceParallel input_layer_norm) will be sharded on dimension 1, but we wanted it to be the whole tensor.
+                # self_attn 的输入（也就是 SequenceParallel input_layer_norm 的输出）会沿维度 1 分片，但我们希望它是完整张量。
                 "self_attn": tp.PrepareModuleInput(
                     input_kwarg_layouts={"hidden_states": Shard(dim=1)},
                     desired_input_kwarg_layouts={"hidden_states": Replicate()},
@@ -95,7 +95,7 @@ def main():
                 "self_attn.k_proj": tp.ColwiseParallel(),
                 "self_attn.v_proj": tp.ColwiseParallel(),
                 "self_attn.o_proj": tp.RowwiseParallel(output_layouts=Shard(1)),
-                # Another sharding along sequence dimension.
+                # 另一次沿序列维度分片。
                 "post_attention_layernorm": tp.SequenceParallel(),
                 "mlp": tp.PrepareModuleInput(
                     input_layouts=Shard(dim=1),
@@ -126,8 +126,8 @@ def main():
     model = torch.compile(model)
     model.loss_function = torch.compile(model.loss_function)
 
-    # NOTE: since this can download data, make sure to do the main process first on each node
-    # since we manually specified HF_HOME to be a node local drive.
+    # 注意：这里可能会下载数据，因此要让每个节点上的主进程先执行，
+    # 因为我们手动把 HF_HOME 指定为节点本地磁盘。
     with rank_ordered(should_go_first=local_rank == 0):
         train_data = _load_and_preprocess_data(args, config)
     LOGGER.info(f"{len(train_data)} training samples")
@@ -138,13 +138,13 @@ def main():
         collate_fn=default_data_collator,
         num_workers=1,
         prefetch_factor=2,
-        # NOTE: this sampler will split dataset evenly across workers
+        # 注意：这个 sampler 会把数据集均匀分给各个 worker。
         sampler=DistributedSampler(
             train_data,
             shuffle=True,
             drop_last=True,
-            num_replicas=mesh["dp"].size(),  # equivalent to `num_nodes`
-            rank=mesh["dp"].get_local_rank(),  # equivalent to `rank // num_nodes`
+            num_replicas=mesh["dp"].size(),  # 等价于 `world_size // args.tp`。
+            rank=mesh["dp"].get_local_rank(),  # 当前 mesh 布局下等价于 `rank // args.tp`。
         ),
     )
     LOGGER.info(f"{len(dataloader)} batches per epoch")
@@ -160,7 +160,7 @@ def main():
         is_experiment = True
         exp_dir = exp_dir / args.experiment_name
 
-    # attempt resume
+    # 尝试恢复训练。
     state = {
         "epoch": 0,
         "global_step": 0,
@@ -204,7 +204,7 @@ def main():
         batches = iter(dataloader)
 
         for i_step in range(len(dataloader)):
-            # NOTE: prefetches the first layer
+            # 注意：预取第一层。
             model.unshard()
 
             with timers["data"], torch.no_grad():
@@ -215,7 +215,7 @@ def main():
                 ).unsqueeze(0)
 
             if i_step < state["epoch_step"]:
-                # NOTE: for resuming
+                # 注意：用于恢复训练。
                 continue
 
             with timers["forward"]:
@@ -264,7 +264,7 @@ def main():
             if is_experiment and state["global_step"] % args.ckpt_freq == 0:
                 LOGGER.info("Saving checkpoint.")
                 dist.barrier()
-                # NOTE: we have to call this on ALL ranks
+                # 注意：必须在所有 rank 上调用。
                 DCP.save(
                     dict(model=model, optimizer=optimizer),
                     checkpoint_id=exp_dir / "checkpoint",
@@ -318,16 +318,16 @@ def _load_and_preprocess_data(args, config):
     if seq_length > config.max_position_embeddings:
         seq_length = min(1024, config.max_position_embeddings)
 
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
+    # 主要的数据处理函数：拼接数据集中的全部文本，并按 seq_length 切分文本块。
     def group_texts(examples):
-        # Concatenate all texts.
+        # 拼接全部文本。
         concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
         total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
-        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
+        # 总长度超过 seq_length 时，截去不足整块的尾部；正长度不足一块时，当前实现仍保留短块。
+        # 如果模型支持填充，也可以改成填充，而不是丢弃；这部分可以按需要自定义。
         if total_length > seq_length:
             total_length = (total_length // seq_length) * seq_length
-        # Split by chunks of max_len.
+        # 按 seq_length 切成块。
         result = {
             k: [t[i : i + seq_length] for i in range(0, total_length, seq_length)]
             for k, t in concatenated_examples.items()

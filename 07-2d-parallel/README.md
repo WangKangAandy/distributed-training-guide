@@ -1,24 +1,24 @@
-# 2d parallelism (TP + DP)
+# 2D 并行（TP + DP）
 
-Using both [FSDP](../04-fully-sharded-data-parallel) and [TP](../06-tensor-parallel) is actually quite simple code wise when starting from our [chapter 6 TP script](../06-tensor-parallel/train_llm.py).
+同时使用 [FSDP](../04-fully-sharded-data-parallel) 和 [TP](../06-tensor-parallel)，从代码角度看其实很简单。起点是[第 6 章的 TP 脚本](../06-tensor-parallel/train_llm.py)。
 
-What does using these two together mean exactly? Let's get into an example with 6 GPUs, 2 way FSDP and 3 way TP:
+两者一起使用究竟是什么意思？下面用 6 张 GPU、2 路 FSDP 和 3 路 TP 作为例子：
 
 <img width="894" alt="image" src="https://github.com/user-attachments/assets/c384756a-66a9-4056-be1b-018fb046e275" />
 
-When we first start out every gpu holds the full model. Then we shard the model into 3 pieces (our TP dimension). The 3 shards in the graphic above are red+orange, yellow+green, and blue+purple. Note that GPU 0 and GPU 3 **have the exact same shard**! This is because they are the same tensor parallel rank, but are different data parallel ranks. This means we have **duplicated** our model across our data parallel dimension.
+一开始，每张 GPU 都持有完整模型。然后把模型切成 3 份，也就是 TP 维度。上图中的 3 个分片是红+橙、黄+绿、蓝+紫。注意 GPU 0 和 GPU 3 **持有完全相同的分片**。这是因为它们的张量并行 rank 相同，但数据并行 rank 不同。这意味着模型沿数据并行维度被**复制**了一份。
 
-When we apply FSDP in the next step, we split those duplicated shards! So Shard red+orange (which is duplicated on GPU 0 & 3) is split into two pieces (Shard red and Shard orange).
+下一步应用 FSDP 时，这些重复的分片会被继续拆开。红+橙这个分片同时存在于 GPU 0 和 GPU 3，会被拆成两块：红色分片和橙色分片。
 
-By the end we have 6 distinct shards of our model split on every GPU.
+最终，模型被拆成 6 个不同分片，每张 GPU 持有一块。
 
-Now if you remember with FSDP, it does an allgather of all the shards before the forward pass. When GPU 0 & GPU 3 are executing their forward passes, they will gather the two shards (Shard red and Shard orange) into local memory to form Shard red+orange, so that each one can use the full shard during computation.
+回忆一下 FSDP：前向之前，它会对所有分片做 all-gather。GPU 0 和 GPU 3 执行前向时，会把红色分片和橙色分片收集到本地显存，组成红+橙分片，这样每张 GPU 在计算时都能使用完整分片。
 
-## Applying FSDP after TP
+## 在 TP 之后应用 FSDP
 
-We are starting from our [chapter 6 code](../06-tensor-parallel/train_llm.py), which already support TP. So we just need to add FSDP to the script:
+起点是已经支持 TP 的[第 6 章代码](../06-tensor-parallel/train_llm.py)，因此只需要把 FSDP 加进脚本。
 
-The api is much simpler than FSDP 1 api, this is all we need to add **after** our TP code:
+这个 API 比 FSDP 1 简单得多。在 TP 代码**之后**，只需要加入：
 
 ```python
 from torch.distributed.fsdp import fully_shard
@@ -28,11 +28,11 @@ for layer in model.model.layers:
 fully_shard(model, mesh=mesh["dp"])
 ```
 
-Note how we are passing our `mesh["dp"]` here to indicate that this is happening across our data parallel dimension.
+注意这里传入 `mesh["dp"]`，表示操作发生在数据并行维度上。
 
-## Controlling TP size
+## 控制 TP 大小
 
-When creating our mesh we are going to set the TP size based on a CLI argument:
+创建 mesh 时，根据命令行参数设置 TP 大小：
 
 ```python
 assert world_size % args.tp == 0
@@ -43,23 +43,25 @@ mesh = dist.device_mesh.init_device_mesh(
 )
 ```
 
-and add it to our argparser:
+并把它加入参数解析器：
 
 ```python
 parser.add_argument("--tp", default=8, type=int)
 ```
 
-## Performance with different configurations
+## 不同配置的性能
 
-Here are some training results for 4 different setups of the TP size:
-- 1x8 is 8 way TP, and no data parallelism. `--batch-size 18 --tp 8`
-- 2x4 is 4 way TP, with 2 groups of FSDP. `--batch-size 14 --tp 4`
-- 4x2 is 2 way TP, with 4 groups of FSDP. `--batch-size 10 --tp 2`
-- 8x1 is FSDP. `--batch-size 7 --tp 1`
+下面是 4 种 TP 大小配置的训练结果：
 
-Note that all of these runs have the same `--lr` while having different batch sizes, which is why the loss curves are slightly different.
+- 1×8 是 8 路 TP，没有数据并行：`--batch-size 18 --tp 8`
+- 2×4 是 4 路 TP，有 2 组 FSDP：`--batch-size 14 --tp 4`
+- 4×2 是 2 路 TP，有 4 组 FSDP：`--batch-size 10 --tp 2`
+- 8×1 是 FSDP：`--batch-size 7 --tp 1`
+
+注意：这些运行使用相同的 `--lr`，但 batch size 不同，因此 loss 曲线会略有差异。
 
 <img src="https://github.com/user-attachments/assets/8645b7d2-992f-4f49-9214-f6c5d4d42c37" width="480px" />
 
 <img src="https://github.com/user-attachments/assets/1b9269ce-c1db-43e4-9fd7-0bbf11871b11" width="480px" />
 
+> 译注：上述配置按 `DP大小 × TP大小` 记，例如 2×4 表示每个 DP/FSDP 通信组有 2 个 rank，每个 TP 组有 4 个 rank。原文的“2 组 FSDP”是指 DP 维度大小为 2；实际有 4 个各含 2 个 rank 的 FSDP 通信组。

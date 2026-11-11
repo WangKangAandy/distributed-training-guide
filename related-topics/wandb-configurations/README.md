@@ -1,10 +1,10 @@
-# wandb configurations
+# wandb 配置
 
-There are a bunch of ways to configure wandb during your training runs. What will work best for you depends on how big your cluster is and what you want to track.
+训练运行期间配置 wandb 有很多方式。哪种最合适取决于集群有多大，以及你想跟踪什么。
 
 ## rank 0
 
-This is the standard approach. You will only see system information from the node that has the rank 0 process, and only data from rank 0 will be logged. It is minimal information, and you still get to track the experiment progress.
+这是标准方法。你只能看到 rank 0 进程所在节点的系统信息，也只会记录 rank 0 的数据。信息量最小，但仍然可以跟踪实验进度。
 
 ```python
 if rank == 0:
@@ -19,9 +19,9 @@ if rank == 0:
     )
 ```
 
-## local_rank 0 (every node)
+## local_rank 0（每个节点）
 
-With this approach you can see system information from all nodes, and it scales linearly with number of nodes. This approach uses [wandb grouped runs](https://docs.wandb.ai/guides/runs/grouping/).
+使用这种方法可以看到所有节点的系统信息，记录数量随节点数线性增长。它使用 [wandb 分组运行](https://docs.wandb.ai/guides/runs/grouping/)。
 
 ```python
 if local_rank == 0:
@@ -37,17 +37,17 @@ if local_rank == 0:
     )
 ```
 
-If you want the name to appear as the node id you can set:
+如果希望名称显示为节点编号，可以设置：
 
 ```python
-name=f"node-{rank // world_size}"
+name=f"node-{rank // torch.cuda.device_count()}"
 ```
 
-## every rank
+## 每个 rank
 
-[Grouping docs](https://docs.wandb.ai/guides/runs/grouping)
+[分组文档](https://docs.wandb.ai/guides/runs/grouping)
 
-This configuration is really useful for tracking as much information about your cluster as possible. The downsides are that if you have a very large cluster, you can hit the ratelimit of wandb, and the wandb graphs become unusable.
+这种配置非常适合尽可能多地跟踪集群信息。缺点是，集群非常大时可能触发 wandb 的速率限制，而且 wandb 图表会变得无法使用。
 
 ```python
 wandb.init(
@@ -61,3 +61,5 @@ wandb.init(
     config=...,
 )
 ```
+
+> 译注：原文用 `rank // world_size` 计算节点编号，结果始终为 0。上例改为除以每节点 GPU 数，假设各节点 GPU 数相同、每 GPU 一个进程且全局 rank 按节点连续分配。异构布局应使用启动器提供的节点标识。

@@ -1,12 +1,12 @@
-# Determinism across resumes
+# 恢复训练时保持确定性
 
-**NOTE: This chapter's code builds off of [chapter 2](../../02-distributed-data-parallel/)'s code.**
+**注意：本章代码基于[第 2 章](../../02-distributed-data-parallel/)的代码。**
 
-See pytorch's documnetation on reproducibility: https://pytorch.org/docs/stable/notes/randomness.html#reproducibility
+PyTorch 关于可复现性的文档：https://pytorch.org/docs/stable/notes/randomness.html#reproducibility
 
-Notably we are also saving & restoring the rng states from various libraries, and explicitly seeding the workers for data loading.
+值得注意的是，我们还会保存并恢复多个库的随机数状态，并显式为数据加载 worker 设置种子。
 
-## Code Changes
+## 代码改动
 
 ```diff
 diff --git a/03-multi-node/train_llm.py b/10-determinism/train_llm.py
@@ -32,7 +32,7 @@ index 24eacbd..0a3a029 100644
          batch_size=args.batch_size,
 @@ -91,6 +94,8 @@ def main():
          num_workers=1,
-         # NOTE: this sampler will split dataset evenly across workers
+         # NOTE: 这个 sampler 会把数据集均匀分给各个 worker
          sampler=DistributedSampler(train_data, shuffle=True, drop_last=True),
 +        worker_init_fn=_seed_worker,
 +        generator=g,
@@ -81,3 +81,5 @@ index 24eacbd..0a3a029 100644
      data = datasets.load_dataset(
          args.dataset_name, trust_remote_code=True, 
 ```
+
+> 译注：上面的 diff 保留了原文历史目录名，用于说明改动，不可直接当作针对当前目录的补丁应用。严格恢复训练还需保存各 rank 自己的 RNG 状态及数据迭代进度；只保存 rank 0 的状态，不能保证所有分布式任务在重启后精确复现。
