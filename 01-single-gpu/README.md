@@ -1,33 +1,10 @@
 # 单卡 GPU 训练
 
-这是一份「标准」的单卡训练脚本。它不做任何分布式操作，目标是尽量简单。
-
-本指南后面的内容都以这份代码为基础，这一章会顺着单卡脚本把完整训练流程讲清楚。
-
-目录结构：
-
-```text
-01-single-gpu/
-├── README.md
-├── train_llm.py    # 参数、模型、优化器、训练循环、日志、显存
-├── data.py         # 加载 / 分词 / 切块
-└── checkpoint.py   # 实验目录、保存与恢复
-```
-
-## 运行代码
-
-```bash
-cd distributed-training-guide/01-single-gpu
-python train_llm.py -d tatsu-lab/alpaca -m openai-community/gpt2
-```
-
-训练参数从命令行传入（`argparse`）。必填的是数据集 `-d/--dataset-name` 和模型 `-m/--model-name`；`-e/--experiment-name` 可省略（省略则不存盘、不续训）。完整列表见 `python train_llm.py --help`。
-
-启动时会配置 Python 内置 `logging`（默认 INFO，输出到标准输出/标准错误）。环境变量与解析后的 `args` 用 `LOGGER.debug(...)` 记录，默认看不到；需要排查多机环境时把级别调到 DEBUG。后面多节点时，核对各机环境是否一致会很有用。
+这是一份「标准」的单卡训练脚本。它不做任何分布式操作，目标是尽量简单。本指南后面的内容都以这份代码为基础。
 
 ## 训练流程概览
 
-一步训练在 PyTorch 里通常可以缩成下面这样（玩具模型，只用来建立心智模型）：
+一步训练在 PyTorch 里通常可以缩成下面这样：
 
 ```python
 import torch
@@ -90,7 +67,24 @@ flowchart TD
 
 ## 训练流程详解
 
-### 1. 初始化模型与设备
+### 脚本与运行
+
+```text
+01-single-gpu/
+├── README.md
+├── train_llm.py    # 参数、模型、优化器、训练循环、日志、显存
+├── data.py         # 加载 / 分词 / 切块
+└── checkpoint.py   # 实验目录、保存与恢复
+```
+
+```bash
+cd distributed-training-guide/01-single-gpu
+python train_llm.py -d tatsu-lab/alpaca -m openai-community/gpt2
+```
+
+必填 `-d/--dataset-name` 与 `-m/--model-name`；`-e/--experiment-name` 可选（省略则不存盘）。其余参数见 `python train_llm.py --help`。默认用 INFO 级别 `logging`；环境与 `args` 的详细信息在 DEBUG 下才会打印。
+
+### 初始化模型与设备
 
 使用 PyTorch 时，在初始化其他对象之前有几件有用的事要做：
 
@@ -144,7 +138,7 @@ model = torch.compile(model)
 
 更激进的用法（连 `loss_function`、`optimizer.step` 一起 compile）会出现在后面章节，例如 [05-training-llama-405b](../05-training-llama-405b/README.md#torchcompile)。单卡这一章先掌握「整模 `torch.compile(model)`」即可。
 
-### 2. 数据集与 DataLoader
+### 数据集与 DataLoader
 
 数据相关逻辑在 `data.py`。我们用 `datasets` 加载并预处理数据。本指南的处理代码来自 https://github.com/huggingface/transformers/blob/v4.45.1/examples/pytorch/language-modeling/run_clm_no_trainer.py。
 
@@ -176,7 +170,7 @@ dataloader = DataLoader(
 - `pin_memory`：默认 `False`。设为 `True` 后，batch 落在页锁定 CPU 内存，主机→GPU 拷贝可以走更快的 DMA，也是 `non_blocking` 异步拷贝的前提之一。
 - `collate_fn`：不写则用 PyTorch 的 `default_collate`；这里显式用 HF 的 `default_data_collator`，和 Transformers 字段更合拍。
 
-### 3. 优化器与学习率调度
+### 优化器与学习率调度
 
 训练一步的核心是：算出 loss → `backward` 得到梯度 → **优化器**按梯度改参数。优化器决定「怎么根据梯度更新权重」。
 
@@ -202,7 +196,7 @@ lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
 
 训练循环里常见顺序是：`optimizer.step()` 用当前学习率更新参数，再 `lr_scheduler.step()` 调度器步数 +1，按余弦规则算出下一步的学习率并写回优化器。不调用后者的话，学习率会一直停在初始值。
 
-### 4. 训练循环
+### 训练循环
 
 标准写法是直接 `enumerate(dataloader)`，每步取出一个 batch 再搬到 GPU：
 
@@ -239,7 +233,7 @@ optimizer.zero_grad(set_to_none=True)
 
 顺序记成：前向 → 反向 → 更新参数 → 推进学习率 → 清梯度，准备下一步。
 
-#### 日志与训练指标
+### 日志与训练指标
 
 记录频率由 `--log-freq` 决定。例如 `--log-freq 100` 表示每 100 步记录一次（step、lr、平均 loss、显存等）。
 
@@ -266,7 +260,7 @@ if state["global_step"] % args.log_freq == 0:
 
 `get_mem_stats` 仍留在 `train_llm.py`，用于读取当前 / 峰值显存。打日志后 `reset_peak_memory_stats` 只重置统计、不释放显存，一般也不触发计算同步。
 
-### 5. 检查点与断点续训
+### 检查点与断点续训
 
 相关逻辑在 `checkpoint.py`。传了 `--experiment-name` 才开启存盘与续训；检查点目录为 `args.save_dir/args.experiment_name`，实验名是一次运行的**唯一**标识。
 
@@ -310,6 +304,5 @@ if is_experiment and state["global_step"] % args.ckpt_freq == 0:
 ## 本章小结
 
 - 单卡脚本刻意保持简单，作为后续分布式章节的共同起点。
-- 主体流程是：**设备与模型 → 数据 → 优化器 → 训练一步（含日志）**；检查点是可选工程配套。
-- 工程外壳（参数、logging 初始化、实验目录）够用即可，不必喧宾夺主。
+- 主体流程是：**设备与模型 → 数据 → 优化器 → 训练一步（含日志）**。
 - 代码按职责拆成 `train_llm.py` / `data.py` / `checkpoint.py`，阅读时以 `train_llm.py` 的训练主线为准。
