@@ -16,29 +16,29 @@ model = nn.Sequential(
     nn.Linear(32, 1),
 )
 
-optimizer = torch.optim.Adam(model.parameters())
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=1000, eta_min=1e-5
+)
 criterion = nn.MSELoss()
 
 x = torch.randn(16, 10)
 target = torch.randn(16, 1)
 
-# 1. 清空梯度
-optimizer.zero_grad()
-
-# 2. 前向传播
+# 1. 前向：算出输出与 loss（本章 Causal LM 常用 model(**batch) 直接得到 loss）
 output = model(x)
-
-# 3. 计算损失
 loss = criterion(output, target)
 
-# 4. 反向传播
+# 2. 反向：对 loss 反传，得到各参数的梯度
 loss.backward()
 
-# 5. 更新参数
+# 3. 更新参数，并推进学习率调度
 optimizer.step()
-```
+lr_scheduler.step()
 
-本章真实脚本与此同构：前向 → 反向 → 更新。差别主要是 Causal LM 常用 `model(**batch)` 直接得到 `loss`（不一定单独写 `criterion`），循环里还会 `lr_scheduler.step()`；`zero_grad` 可以放在 `step` 之后，与「下一步开始前清空」等价。
+# 4. 清空梯度，准备下一步（也可写在下一步开始前）
+optimizer.zero_grad()
+```
 
 一次训练的主体流程：
 
@@ -51,19 +51,6 @@ optimizer.step()
    - 反向：对 loss 反传，得到各参数的梯度
    - 更新参数：优化器用当前学习率改权重，并推进学习率调度
    - 打日志：按间隔记录 loss、学习率、显存等指标
-
-```mermaid
-flowchart TD
-  A[初始化设备 / 模型] --> B[准备数据与 DataLoader]
-  B --> C[优化器与学习率调度]
-  C --> D[训练循环]
-  D --> E[取 batch 并搬到 GPU]
-  E --> F[前向算 loss]
-  F --> G[反向算梯度]
-  G --> H[更新参数 / 推进 lr]
-  H --> I[打日志]
-  I --> D
-```
 
 ## 2. 训练流程详解
 
