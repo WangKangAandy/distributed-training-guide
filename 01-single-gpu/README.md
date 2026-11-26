@@ -1,72 +1,79 @@
-# 单卡 GPU
+# 单卡 GPU 训练
 
-这是一份「标准」的单卡训练脚本。它不做任何分布式操作，目标是尽量简单。
+这是一份「标准」的单卡训练脚本。它不做任何分布式操作，目标是尽量简单。本指南后面的内容都以这份代码为基础。
 
-本指南后面的内容都以这份代码为基础，所以这一章会说明代码的各个部分，以及为什么要这样写。
+## 1. 训练流程概览
 
-## 命令
+一步训练在 PyTorch 里通常可以缩成下面这样：
+
+```python
+import torch
+import torch.nn as nn
+
+model = nn.Sequential(
+    nn.Linear(10, 32),
+    nn.ReLU(),
+    nn.Linear(32, 1),
+)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=1000, eta_min=1e-5
+)
+criterion = nn.MSELoss()
+
+x = torch.randn(16, 10)
+target = torch.randn(16, 1)
+
+# 1. 前向：算出输出与 loss（本章 Causal LM 常用 model(**batch) 直接得到 loss）
+output = model(x)
+loss = criterion(output, target)
+
+# 2. 反向：对 loss 反传，得到各参数的梯度
+loss.backward()
+
+# 3. 更新参数，并推进学习率调度
+optimizer.step()
+lr_scheduler.step()
+
+# 4. 清空梯度，准备下一步（也可写在下一步开始前）
+optimizer.zero_grad()
+```
+
+一次训练的主体流程：
+
+1. 选定 GPU / bf16，设随机种子，初始化模型（可 `torch.compile`）
+2. 加载并预处理数据，构建 `DataLoader`
+3. 创建优化器与学习率调度器
+4. 进入训练循环：
+   - 取 batch：从 DataLoader 取出一批样本，并搬到 GPU
+   - 前向：模型根据输入计算 logits 与 loss
+   - 反向：对 loss 反传，得到各参数的梯度
+   - 更新参数：优化器用当前学习率改权重，并推进学习率调度
+   - 打日志：按间隔记录 loss、学习率、显存等指标
+
+## 2. 训练流程详解
+
+本章代码在 `01-single-gpu/`：
+
+```text
+01-single-gpu/
+├── README.md
+├── train_llm.py    # 参数、模型、优化器、训练循环、日志、显存
+├── data.py         # 加载 / 分词 / 切块
+└── checkpoint.py   # 实验目录、保存与恢复
+```
+
+运行示例：
 
 ```bash
 cd distributed-training-guide/01-single-gpu
 python train_llm.py -d tatsu-lab/alpaca -m openai-community/gpt2
 ```
 
-## 代码说明
+必填 `-d/--dataset-name` 与 `-m/--model-name`；`-e/--experiment-name` 可选（省略则不存盘）。其余参数见 `python train_llm.py --help`。默认用 INFO 级别 `logging`；环境与 `args` 的详细信息在 DEBUG 下才会打印。
 
-说明大致按代码顺序，从文件顶部开始。
-
-### 参数解析
-
-训练脚本是一个命令行程序，也就是从终端运行。我们希望使用者能在命令行里修改一批参数。下面是很常见的 Python 写法：
-
-```python
-def main():
-    parser = _get_parser()
-    args = parser.parse_args()
-
-
-def _get_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--experiment-name", default=None, required=True)
-    parser.add_argument("--dataset-name", default=None, required=True)
-    parser.add_argument("--model-name", default=None, required=True)
-    parser.add_argument("--save-dir", default="../outputs")
-    parser.add_argument("--seed", default=0, type=int)
-    parser.add_argument("--num-epochs", default=100, type=int)
-    parser.add_argument("--lr", default=3e-5, type=float)
-    parser.add_argument("--batch-size", default=1, type=int)
-    parser.add_argument("--log-freq", default=10, type=int)
-    parser.add_argument("--ckpt-freq", default=500, type=int)
-    return parser
-
-
-if __name__ == "__main__":
-    main()
-```
-
-> 译注：上面的参数解析是原文的简化示例。实际脚本中 `--experiment-name` 可省略，`--dataset-name` 和 `--model-name` 分别支持 `-d`、`-m` 别名；完整参数以 `python train_llm.py --help` 为准。
-
-### 配置日志
-
-本指南只用 Python 内置的 `logging`。日志会输出到标准输出和标准错误，之后再用命令行工具把输出重定向到文件。
-
-```python
-LOGGER = logging.getLogger(__name__)
-
-logging.basicConfig(
-    format=f"[%(asctime)s] %(levelname)s:%(message)s",
-    level=logging.INFO,
-)
-
-LOGGER.info(os.environ)
-LOGGER.info(args)
-```
-
-能看到程序运行时的环境变量和命令行参数很有用，后面涉及多台机器时尤其如此。所以示例把这两项放在最前面记录。
-
-> 译注：实际脚本对这两项使用 `LOGGER.debug(...)`，默认 INFO 级别不会显示；需要查看时应将日志级别设为 DEBUG。
-
-### PyTorch 初始化
+### 2.1 初始化模型与设备
 
 使用 PyTorch 时，在初始化其他对象之前有几件有用的事要做：
 
@@ -77,8 +84,6 @@ torch.manual_seed(args.seed)
 ```
 
 这里指定脚本其余部分使用 GPU（具体是 CUDA 设备），并用 bfloat16（也叫 bf16）训练。它是 16 位浮点数；float 是 32 位，double 是 64 位。
-
-### 初始化模型
 
 我们用 `transformers` 训练一个 BF16 因果语言模型（可以把它理解成 GPT）。脚本里用 `with device:` 在 GPU 上直接建模型，而不是先在 CPU 建好再 `.to(device)`：
 
@@ -104,8 +109,6 @@ with device:
 
 注意：这只优化**初始化**（更快、峰值更低），**不加速后续训练**。模型已经在 CUDA 上之后，forward / backward 速度与用 `.to(device)` 搬过去的相同。它也只影响块内新建的对象；DataLoader 在 CPU 上拼出的 batch，训练循环里仍要 `.to(device, non_blocking=True)`（见下文）。
 
-### torch.compile
-
 模型建好之后，脚本还会做一步：
 
 ```python
@@ -120,17 +123,23 @@ model = torch.compile(model)
 
 - **首次**跑若干 step 会偏慢（要追踪、编译）；编译完成后才是稳态速度。看吞吐时别拿最初几步当基准。
 - 需要较新的 PyTorch（建议 2.x）和可用的 GPU 编译环境；出奇怪报错时，可先注释掉这一行做对比排查。
-- 它加速的是**已在 GPU 上的计算**；和上一节的 `with device:` 不同——后者只影响建模时的设备与峰值显存，不加速 step。
+- 它加速的是**已在 GPU 上的计算**；和上面的 `with device:` 不同——后者只影响建模时的设备与峰值显存，不加速 step。
 
 更激进的用法（连 `loss_function`、`optimizer.step` 一起 compile）会出现在后面章节，例如 [05-training-llama-405b](../05-training-llama-405b/README.md#torchcompile)。单卡这一章先掌握「整模 `torch.compile(model)`」即可。
 
-### 初始化数据集
+### 2.2 数据集与 DataLoader
 
-我们用 `datasets` 加载并预处理数据。本指南的处理代码来自 https://github.com/huggingface/transformers/blob/v4.45.1/examples/pytorch/language-modeling/run_clm_no_trainer.py。
+数据相关逻辑在 `data.py`。我们用 `datasets` 加载并预处理数据。本指南的处理代码来自 https://github.com/huggingface/transformers/blob/v4.45.1/examples/pytorch/language-modeling/run_clm_no_trainer.py。
 
-如果想了解更多，建议读者直接查看 `datasets`。
+入口里调用：
 
-### 数据加载（DataLoader）
+```python
+train_data = load_and_preprocess_data(args, config)
+```
+
+`load_and_preprocess_data` 会：加载数据集与分词器 → `map` 分词（可用 `num_proc` 多进程加速预处理）→ 按 `seq_length` 拼接并切块 → 构造 `labels`（Causal LM 下通常等于 `input_ids`）。`load_from_cache_file=True` 时，重复运行可直接读缓存。若想了解更多，建议直接查看 `datasets`。
+
+`DataLoader` 仍在 `train_llm.py` 中构建（逻辑很短，不必再包一层）：
 
 ```python
 dataloader = DataLoader(
@@ -150,7 +159,7 @@ dataloader = DataLoader(
 - `pin_memory`：默认 `False`。设为 `True` 后，batch 落在页锁定 CPU 内存，主机→GPU 拷贝可以走更快的 DMA，也是 `non_blocking` 异步拷贝的前提之一。
 - `collate_fn`：不写则用 PyTorch 的 `default_collate`；这里显式用 HF 的 `default_data_collator`，和 Transformers 字段更合拍。
 
-### 优化器与学习率调度
+### 2.3 优化器与学习率调度
 
 训练一步的核心是：算出 loss → `backward` 得到梯度 → **优化器**按梯度改参数。优化器决定「怎么根据梯度更新权重」。
 
@@ -160,9 +169,9 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
 
 - `model.parameters()`：要更新的模型参数。
 - `lr`：基础学习率（步长）；太大易不稳，太小收敛慢。
-- `fused`：默认 `False`；`True` 走融合 CUDA kernel，更新通常更快。
+- `fused`：默认 `False`；`True` 走融合 CUDA kernel，更新通常更快。本指南各章都显式打开。
 
-学习率不必全程固定。**学习率调度器**（lr_scheduler）在训练过程中调整 `optimizer` 的 lr 。这里用余弦退火：从当前 lr 按余弦曲线降到 `eta_min`。
+学习率不必全程固定。**学习率调度器**（lr_scheduler）在训练过程中调整 `optimizer` 的 lr。这里用余弦退火：从当前 lr 按余弦曲线降到 `eta_min`。
 
 ```python
 lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -176,35 +185,7 @@ lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
 
 训练循环里常见顺序是：`optimizer.step()` 用当前学习率更新参数，再 `lr_scheduler.step()` 调度器步数 +1，按余弦规则算出下一步的学习率并写回优化器。不调用后者的话，学习率会一直停在初始值。
 
-### 输出与恢复训练
-
-检查点保存在 `args.save_dir/args.experiment_name`。`--experiment-name` 是一次运行的**唯一**标识。
-
-```python
-exp_dir: Path = Path(args.save_dir) / args.experiment_name
-```
-
-如果 `args.save_dir/args.experiment_name/state.json` 已经存在，就尝试恢复。也就是说，这个实验名已经有检查点时，我们把它解释为一次续训。
-
-```python
-state = {
-    "epoch": 0,
-    "global_step": 0,
-    "epoch_step": 0,
-}
-# loss 在 GPU 上累加，不放进 state（避免每步 .item() 同步，也无法直接写入 JSON）
-running_loss = torch.zeros((), device=device, dtype=torch.float32)
-resumed = False
-if (exp_dir / "state.json").exists():
-    model.load_state_dict(_load_to_device(exp_dir / "model.pt"))
-    optimizer.load_state_dict(_load_to_device(exp_dir / "optimizer.pt"))
-    lr_scheduler.load_state_dict(_load_to_device(exp_dir / "lr_scheduler.pt"))
-    with open(exp_dir / "state.json") as fp:
-        state = json.load(fp)
-    resumed = True
-```
-
-### 遍历 batch
+### 2.4 训练循环
 
 标准写法是直接 `enumerate(dataloader)`，每步取出一个 batch 再搬到 GPU：
 
@@ -220,9 +201,7 @@ for i_step, batch in enumerate(dataloader):
 
 - `enumerate`：同时拿到本 epoch 内的步号 `i_step` 和数据 `batch`。
 - `i_step < state["epoch_step"]` 时 `continue`：断点续训用。`epoch_step` 记录中断前已训到哪一步；前面的步只跳过训练，但 `enumerate` 仍会按同样顺序取到 batch，这样在 `shuffle=True` 时后面接着训的样本顺序才对得上。
-- `.to(device, non_blocking=True)`：按 batch 从 CPU 拷到 GPU（不是整库常驻显存）。`non_blocking=True` **让拷贝异步提交，常与 DataLoader 的** `pin_memory=True` **一起用，便于和 GPU 计算重叠**；GPU 真正用到这些张量时，流上仍会等拷完。注意这里的 `.items()` 是字典遍历，不是会强制同步的 `tensor.item()`。
-
-### 前向、反向和参数更新
+- `.to(device, non_blocking=True)`：按 batch 从 CPU 拷到 GPU（不是整库常驻显存）。`non_blocking=True` 让拷贝异步提交，常与 DataLoader 的 `pin_memory=True` 一起用，便于和 GPU 计算重叠；GPU 真正用到这些张量时，流上仍会等拷完。注意这里的 `.items()` 是字典遍历，不是会强制同步的 `tensor.item()`。
 
 标准的一步训练：
 
@@ -239,11 +218,11 @@ optimizer.zero_grad(set_to_none=True)
 - `loss.backward()`：反向。沿计算图反传，把梯度写到各参数的 `.grad`。
 - `optimizer.step()`：用**当前**学习率和刚算出的梯度更新权重。
 - `lr_scheduler.step()`：调度器步数 +1，按规则把学习率改成**下一步**要用的值。
-- `optimizer.zero_grad(set_to_none=True)`：清掉 `.grad`；`set_to_none = True` 置 `None` 更省显存（1.x 默认填 0，2.0+ 默认已是 `True`）。
+- `optimizer.zero_grad(set_to_none=True)`：清掉 `.grad`；`set_to_none=True` 置 `None` 更省显存（1.x 默认填 0，2.0+ 默认已是 `True`）。
 
 顺序记成：前向 → 反向 → 更新参数 → 推进学习率 → 清梯度，准备下一步。
 
-### 输出到标准输出
+### 2.5 日志与训练指标
 
 记录频率由 `--log-freq` 决定。例如 `--log-freq 100` 表示每 100 步记录一次（step、lr、平均 loss、显存等）。
 
@@ -264,21 +243,55 @@ if state["global_step"] % args.log_freq == 0:
     }
 
     LOGGER.info(info)
+    torch.cuda.reset_peak_memory_stats(device)  # 清峰值计数，下一段 peak_* 只反映本窗口
     running_loss.zero_()
 ```
 
-### 检查点
+`get_mem_stats` 仍留在 `train_llm.py`，用于读取当前 / 峰值显存。打日志后 `reset_peak_memory_stats` 只重置统计、不释放显存，一般也不触发计算同步。
 
-最后一段是保存检查点的逻辑，这里直接使用 `torch.save`。
+### 2.6 检查点与断点续训
 
-注意：除了模型，还要保存优化器和学习率调度器。
+相关逻辑在 `checkpoint.py`。传了 `--experiment-name` 才开启存盘与续训；检查点目录为 `args.save_dir/args.experiment_name`，实验名是一次运行的**唯一**标识。
 
 ```python
-if state["global_step"] % args.ckpt_freq == 0:
-    LOGGER.info("Saving checkpoint.")
-    torch.save(optimizer.state_dict(), exp_dir / "optimizer.pt")
-    torch.save(model.state_dict(), exp_dir / "model.pt")
-    torch.save(lr_scheduler.state_dict(), exp_dir / "lr_scheduler.pt")
-    with open(exp_dir / "state.json", "w") as fp:
-        json.dump(state, fp)
+is_experiment, exp_dir = resolve_experiment_dir(args)
 ```
+
+`state` 记录训练进度（与权重分开存）：
+
+```python
+state = {
+    "epoch": 0,
+    "global_step": 0,
+    "epoch_step": 0,
+}
+# loss 在 GPU 上累加，不放进 state（避免每步 .item() 同步，也无法直接写入 JSON）
+running_loss = torch.zeros((), device=device, dtype=torch.float32)
+```
+
+若目录里已有 `state.json`，启动时会恢复模型、优化器、调度器与进度（**在训练循环之前**）：
+
+```python
+if is_experiment:
+    state, resumed = resume_if_available(
+        exp_dir, device, model, optimizer, lr_scheduler, state
+    )
+    ensure_experiment_dir(exp_dir)
+```
+
+加载时使用 `map_location=device` 与 `weights_only=True`（降低恶意 pickle 风险）。旧 checkpoint 若含 `running_loss` 字段会丢弃，累加器不落盘。
+
+循环中每隔 `--ckpt-freq` 步保存一次。除了模型，还要保存优化器和学习率调度器：
+
+```python
+if is_experiment and state["global_step"] % args.ckpt_freq == 0:
+    save_checkpoint(exp_dir, model, optimizer, lr_scheduler, state)
+```
+
+`save_checkpoint` 会写入 `model.pt` / `optimizer.pt` / `lr_scheduler.pt` / `state.json`。有 `state.json` 时，下次用同一实验名启动才会走恢复逻辑。
+
+## 3. 本章小结
+
+- 单卡脚本刻意保持简单，作为后续分布式章节的共同起点。
+- 主体流程是：**设备与模型 → 数据 → 优化器 → 训练一步（含日志）**。
+- 代码按职责拆成 `train_llm.py` / `data.py` / `checkpoint.py`，阅读时以 `train_llm.py` 的训练主线为准。
