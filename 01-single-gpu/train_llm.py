@@ -1,21 +1,23 @@
 import argparse
-from itertools import chain
-import json
-import multiprocessing
-import os
-from pathlib import Path
 import logging
+import os
 
 import torch
 from torch.utils.data import DataLoader
 import tqdm
-import datasets
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
-    AutoTokenizer,
     default_data_collator,
 )
+
+from checkpoint import (
+    ensure_experiment_dir,
+    resolve_experiment_dir,
+    resume_if_available,
+    save_checkpoint,
+)
+from data import load_and_preprocess_data
 
 # 本模块专用的 logger，方便按模块过滤日志
 LOGGER = logging.getLogger(__name__)
@@ -61,7 +63,7 @@ def main():
     LOGGER.info(f"Initialized model uses {get_mem_stats(device)['curr_alloc_gb']}gb")
 
     # 下载/加载数据集，分词并切成固定长度的训练样本
-    train_data = _load_and_preprocess_data(args, config)
+    train_data = load_and_preprocess_data(args, config)
     LOGGER.debug(f"{len(train_data)} training samples")
 
     # 标准的 PyTorch 数据集迭代器。
@@ -86,13 +88,7 @@ def main():
         optimizer, T_max=1000, eta_min=args.lr * 1e-2
     )
 
-    # 「实验」= 给这次 run 起名，用来存 checkpoint / 断点续训。
-    # 不传 --experiment-name：只训练、不落盘；传了：目录为 save_dir/实验名/
-    is_experiment = False
-    exp_dir: Path = Path(args.save_dir)
-    if args.experiment_name is not None:
-        is_experiment = True
-        exp_dir = exp_dir / args.experiment_name  # 同名实验共享同一目录
+    is_experiment, exp_dir = resolve_experiment_dir(args)
 
     # state：训练进度（与权重分开存，方便续训时知道从哪一步接着跑）
     state = {
@@ -102,29 +98,13 @@ def main():
     }
     # 两次打日志之间的 loss 累加在 GPU 上，避免每步 .item() 触发同步
     running_loss = torch.zeros((), device=device, dtype=torch.float32)
-    resumed = False  # 本次是否从旧 checkpoint 恢复
 
-    # 同名实验目录里已有 state.json → 视为续训：权重 + 进度一并读回
-    if is_experiment and (exp_dir / "state.json").exists():
-        # map_location：把保存时的张量加载到当前 device
-        # weights_only=True：只反序列化张量，降低恶意 pickle 风险
-        def _load_to_device(p):
-            return torch.load(p, map_location=device, weights_only=True)
-
-        model.load_state_dict(_load_to_device(exp_dir / "model.pt"))  # 模型权重
-        optimizer.load_state_dict(_load_to_device(exp_dir / "optimizer.pt"))  # 优化器状态（动量等）
-        lr_scheduler.load_state_dict(_load_to_device(exp_dir / "lr_scheduler.pt"))  # 调度器进度（当前 lr）
-        with open(exp_dir / "state.json") as fp:
-            state = json.load(fp)  # 覆盖上面的默认进度
-        state.pop("running_loss", None)  # 旧 checkpoint 可能带该字段；累加器不落盘
-        resumed = True
     if is_experiment:
+        state, resumed = resume_if_available(
+            exp_dir, device, model, optimizer, lr_scheduler, state
+        )
         LOGGER.info(f"Resumed={resumed} | {state}")
-
-    if is_experiment:
-        LOGGER.info(f"Creating experiment root directory")
-        # 确保存盘目录存在（续训时目录已在，exist_ok 避免报错）
-        exp_dir.mkdir(parents=True, exist_ok=True)
+        ensure_experiment_dir(exp_dir)
 
     # 从上次停的 epoch 继续，训到 num_epochs
     for state["epoch"] in range(state["epoch"], args.num_epochs):
@@ -164,7 +144,7 @@ def main():
             state["global_step"] += 1
             state["epoch_step"] += 1
             # detach：不建图；留在 GPU 上累加，一般不强制同步
-            # 不要用 running_loss += outputs.loss.item()，因为这会每个step都同步一次，影响性能
+            # 不要用 running_loss += outputs.loss.item()，因为这会每个 step 都同步一次，影响性能
             running_loss += outputs.loss.detach().float()
             progress_bar.update(1)
 
@@ -173,9 +153,9 @@ def main():
                 info = {
                     "global_step": state["global_step"],
                     "lr": lr_scheduler.get_last_lr()[0],
-                    "running_loss": (running_loss / args.log_freq).item(),  # 这里才开始同步一次
+                    "running_loss": (running_loss / args.log_freq).item(),
                     "epoch": state["epoch"],
-                    "epoch_progress": state["epoch_step"] / len(dataloader),   
+                    "epoch_progress": state["epoch_step"] / len(dataloader),
                     "num_batches_remaining": len(dataloader) - i_step,
                     **get_mem_stats(device),
                 }
@@ -187,81 +167,10 @@ def main():
 
             # 仅实验模式：每隔 ckpt_freq 步写断点，同名实验可续训
             if is_experiment and state["global_step"] % args.ckpt_freq == 0:
-                LOGGER.info("Saving checkpoint.")
-                torch.save(optimizer.state_dict(), exp_dir / "optimizer.pt")
-                torch.save(model.state_dict(), exp_dir / "model.pt")
-                torch.save(lr_scheduler.state_dict(), exp_dir / "lr_scheduler.pt")
-                with open(exp_dir / "state.json", "w") as fp:
-                    json.dump(state, fp)  # 有 state.json 启动时才会走恢复逻辑
+                save_checkpoint(exp_dir, model, optimizer, lr_scheduler, state)
 
         # 本 epoch 结束，下一轮从 step 0 开始
         state["epoch_step"] = 0
-
-
-def _load_and_preprocess_data(args, config):
-    """
-    Function created using code found in
-    https://github.com/huggingface/transformers/blob/v4.45.1/examples/pytorch/language-modeling/run_clm_no_trainer.py
-    """
-    # 分词器：把文本变成 token id，需与模型词表匹配
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-
-    # 从 Hugging Face Hub（或本地）加载数据集；subset 是子集名（有的数据集需要）
-    data = datasets.load_dataset(args.dataset_name, args.dataset_subset)
-
-    # 找出文本所在的列名（常见叫 "text"，否则用第一列）
-    column_names = data["train"].column_names
-    text_column_name = "text" if "text" in column_names else column_names[0]
-
-    # 对一批样本文本做分词
-    def tokenize_function(examples):
-        return tokenizer(examples[text_column_name])
-
-    # map：对整份数据集并行分词；去掉原始文本列，只保留 token 相关字段
-    tokenized_datasets = data.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=column_names,
-        num_proc=multiprocessing.cpu_count(),  # 开多个进程并行跑分词，进程数设为 CPU 核数，提高数据预处理效率
-        load_from_cache_file=True,  # 有缓存则直接读，避免重复分词
-        desc="Running tokenizer on dataset",
-    )
-
-    # 训练序列长度：命令行指定，或退回 tokenizer 默认最大长度
-    seq_length = args.seq_length or tokenizer.model_max_length
-    # 不能超过模型位置编码上限；过大时压到 min(1024, max_position_embeddings)
-    if seq_length > config.max_position_embeddings:
-        seq_length = min(1024, config.max_position_embeddings)
-
-    # 主要的数据处理函数：拼接数据集中的全部文本，并按 seq_length 切分文本块。
-    def group_texts(examples):
-        # 拼接全部文本。
-        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # 总长度超过 seq_length 时，截去不足整块的尾部；正长度不足一块时，当前实现仍保留短块。
-        # 如果模型支持填充，也可以改成填充，而不是丢弃；这部分可以按需要自定义。
-        if total_length > seq_length:
-            total_length = (total_length // seq_length) * seq_length
-        # 按 seq_length 切成块。
-        result = {
-            k: [t[i : i + seq_length] for i in range(0, total_length, seq_length)]
-            for k, t in concatenated_examples.items()
-        }
-        # Causal LM 的标签通常就是 input_ids 本身（预测下一个 token）
-        result["labels"] = result["input_ids"].copy()
-        return result
-
-    # 再 map 一次：把 token 流切成固定长度块，供训练直接用
-    lm_datasets = tokenized_datasets.map(
-        group_texts,
-        batched=True,
-        num_proc=multiprocessing.cpu_count(),
-        load_from_cache_file=True,
-        desc=f"Grouping texts in chunks of {seq_length}",
-    )
-
-    # 本脚本只用训练集
-    return lm_datasets["train"]
 
 
 def get_mem_stats(device=None):
