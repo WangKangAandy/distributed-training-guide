@@ -32,7 +32,12 @@ python train_llm.py -d tatsu-lab/alpaca -m openai-community/gpt2
 1. 选定 GPU / bf16，设随机种子，初始化模型（可 `torch.compile`）
 2. 加载并预处理数据，构建 `DataLoader`
 3. 创建优化器与学习率调度器
-4. 进入训练循环：取 batch → 前向 → 反向 → 更新参数 → 打日志
+4. 进入训练循环：
+   - 取 batch：从 DataLoader 取出一批样本，并搬到 GPU
+   - 前向：模型根据输入计算 logits 与 loss
+   - 反向：对 loss 反传，得到各参数的梯度
+   - 更新参数：优化器用当前学习率改权重，并推进学习率调度
+   - 打日志：按间隔记录 loss、学习率、显存等指标
 
 ```mermaid
 flowchart TD
