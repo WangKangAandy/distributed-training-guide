@@ -27,6 +27,42 @@ python train_llm.py -d tatsu-lab/alpaca -m openai-community/gpt2
 
 ## 训练流程概览
 
+一步训练在 PyTorch 里通常可以缩成下面这样（玩具模型，只用来建立心智模型）：
+
+```python
+import torch
+import torch.nn as nn
+
+model = nn.Sequential(
+    nn.Linear(10, 32),
+    nn.ReLU(),
+    nn.Linear(32, 1),
+)
+
+optimizer = torch.optim.Adam(model.parameters())
+criterion = nn.MSELoss()
+
+x = torch.randn(16, 10)
+target = torch.randn(16, 1)
+
+# 1. 清空梯度
+optimizer.zero_grad()
+
+# 2. 前向传播
+output = model(x)
+
+# 3. 计算损失
+loss = criterion(output, target)
+
+# 4. 反向传播
+loss.backward()
+
+# 5. 更新参数
+optimizer.step()
+```
+
+本章真实脚本与此同构：前向 → 反向 → 更新。差别主要是 Causal LM 常用 `model(**batch)` 直接得到 `loss`（不一定单独写 `criterion`），循环里还会 `lr_scheduler.step()`；`zero_grad` 可以放在 `step` 之后，与「下一步开始前清空」等价。
+
 一次训练的主体流程：
 
 1. 选定 GPU / bf16，设随机种子，初始化模型（可 `torch.compile`）
