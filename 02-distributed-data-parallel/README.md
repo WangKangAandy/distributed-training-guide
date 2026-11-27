@@ -2,6 +2,16 @@
 
 本章在[第 1 章](../01-single-gpu)单卡脚本上，改成单节点多 GPU 的数据并行训练。训练循环本身还是前向、反向、更新；变化是由多个进程一起跑这份代码。
 
+脚本同样拆成三份，与第 1 章同构、各自独立（不跨章 import）：
+
+```text
+├── train_llm.py    # 分布式启动、DDP / ZeRO、DistributedSampler、训练循环
+├── data.py         # 加载 / 分词 / 切块（与第 1 章同构）
+└── checkpoint.py   # 实验目录、保存与恢复（与第 1 章同构；ZeRO 时由 train_llm 跳过优化器落盘）
+```
+
+`rank0_first`、barrier、ZeRO 跳过优化器等分布式协调都留在 `train_llm.py`。
+
 ## 1. 从单卡训练到多 GPU 训练
 
 上一章用一个 Python 进程和一张 GPU 完成训练：读 batch、前向、算梯度、更新参数。
