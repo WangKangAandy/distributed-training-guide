@@ -1,330 +1,279 @@
 import argparse
-from contextlib import contextmanager
-from itertools import chain
-import json
+import logging
 import multiprocessing
 import os
-import time
-from pathlib import Path
-import logging
 
 import torch
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel
 from torch import distributed as dist
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.optim import ZeroRedundancyOptimizer
-
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import tqdm
-import datasets
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
-    AutoTokenizer,
     default_data_collator,
 )
 
+from checkpoint import (
+    ensure_experiment_dir,
+    resolve_experiment_dir,
+    resume_if_available,
+    save_checkpoint,
+)
+from data import load_and_preprocess_data
+
+# 本模块专用的 logger，方便按模块过滤日志
 LOGGER = logging.getLogger(__name__)
 
 
+# @record：worker 异常时把完整堆栈写入 TORCHELASTIC_ERROR_FILE（需配合 torchrun 环境变量）
 @record
 def main():
+    # 解析命令行参数（模型名、数据集、学习率等）
     parser = _get_parser()
     args = parser.parse_args()
 
-    rank = int(os.getenv("RANK", "0"))
-    local_rank = rank % torch.cuda.device_count()
-    world_size = int(os.getenv("WORLD_SIZE", "1"))
-    device = torch.device(f"cuda:{local_rank}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(rank=rank, world_size=world_size, device_id=device)
+    # torchrun 注入的环境变量（每个进程各自一份）
+    rank = int(os.environ["RANK"])  # 全局进程编号 0 … world_size-1
+    local_rank = int(os.environ["LOCAL_RANK"])  # 本机内编号，用来绑 GPU
+    world_size = int(os.environ["WORLD_SIZE"])  # 进程总数（≈ GPU 数，单节点时）
 
+    # 本进程只用一张卡：cuda:local_rank（不要用 rank % 卡数，多节点会绑错）
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)  # 设当前默认 CUDA 设备，后续分配落在这张卡
+
+    # 初始化进程组：阻塞直到 WORLD_SIZE 个进程都到齐
+    # backend=nccl：GPU 常用通信后端；device_id：告知进程组本进程对应哪张 GPU
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+    )
+
+    # 日志带上 rank，多进程写同一文件时也好区分
     logging.basicConfig(
         format=f"[rank={rank}] [%(asctime)s] %(levelname)s:%(message)s",
         level=logging.INFO,
     )
 
+    # 多节点时 DEBUG 打印环境，便于确认各节点配置一致
     LOGGER.debug(os.environ)
     LOGGER.debug(args)
     LOGGER.debug(f"local_rank={local_rank} rank={rank} world_size={world_size}")
 
+    # 本指南假设 CUDA 可用，并统一用 bf16 训练
     dtype = torch.bfloat16
+    # 为 PyTorch 随机数生成器设种子（各进程相同种子 + DDP 广播，副本可对齐）
     torch.manual_seed(args.seed)
 
-    # 注意：假设 $HF_HOME 是共享存储。
-    with rank0_first(), device:
-        config = AutoConfig.from_pretrained(args.model_name, use_cache=False)
+    # 训练阶段只读本地/缓存制品（local_files_only），不负责联网下载。
+    # from_config：按配置随机初始化（从头训练），不加载预训练权重。
+    # 本章不引入 torch.compile，避免把编译器优化混入 DDP 入门主线。
+    # with device: 新建参数默认落在本进程 GPU，省去再 .to(device)
+    with device:
+        # 只读模型配置（层数、隐层等）；use_cache=False 关掉 KV Cache（训练不需要）
+        config = AutoConfig.from_pretrained(
+            args.model_name, local_files_only=True, use_cache=False
+        )
+        # 按配置新建 Causal LM；权重是随机的，不是 Hub 上的预训练权重
         model = AutoModelForCausalLM.from_config(config, dtype=dtype)
     LOGGER.info(
         f"Training {sum(p.numel() for p in model.parameters())} model parameters"
     )
-
-    model = torch.compile(model)
     LOGGER.info(f"Initialized model uses {get_mem_stats(device)['curr_alloc_gb']}gb")
 
+    # DDP 包装：反向时在进程间同步（平均）梯度；不负责切分数据
+    # device_ids：本进程可见的 GPU；bucket_cap_mb / gradient_as_bucket_view：通信分桶相关优化
     model = DistributedDataParallel(
         model, device_ids=[local_rank], bucket_cap_mb=500, gradient_as_bucket_view=True
     )
     LOGGER.info(f"After DDP: model uses {get_mem_stats(device)['curr_alloc_gb']}gb")
 
-    # 注意：假设 $HF_HOME 是共享存储。
-    with rank0_first():
-        train_data = _load_and_preprocess_data(args, config)
+    # 每个 rank 都会跑 datasets.map；按 world_size 均分 CPU，避免 8 进程各开满核
+    num_proc = max(1, multiprocessing.cpu_count() // world_size)
+    # 加载/分词/切块；local_files_only ≠ 预处理已完成，缓存未命中时仍会 map
+    train_data = load_and_preprocess_data(args, config, num_proc=num_proc)
     LOGGER.debug(f"{len(train_data)} training samples")
 
+    # 标准 PyTorch DataLoader；分布式下用 sampler 分片，不要再设 shuffle=True
     dataloader = DataLoader(
         train_data,
-        batch_size=args.batch_size,
-        collate_fn=default_data_collator,
-        num_workers=1,
-        prefetch_factor=2,
-        # 注意：这个 sampler 会把数据集均匀分给各个 worker。
+        batch_size=args.batch_size,  # 每进程 batch；全局 ≈ batch_size * world_size
+        num_workers=2,  # 每进程额外 2 个取数 worker（可与 GPU 计算重叠）
+        prefetch_factor=2,  # 每个 worker 预取 2 个 batch（仅 num_workers>0 时有效）
+        pin_memory=True,  # 页锁定内存，便于后面 non_blocking 异步 H2D
+        collate_fn=default_data_collator,  # HF collator；拼成模型可用的 batch 字典
+        # DistributedSampler：按索引给各进程不同样本；drop_last 保证各进程步数一致
         sampler=DistributedSampler(train_data, shuffle=True, drop_last=True),
     )
-    LOGGER.debug(f"{len(dataloader)} batches per epoch")
+    LOGGER.info(f"{len(dataloader)} batches per epoch")
 
+    # ZeRO：把优化器状态切分到各 GPU 以省显存；本章不保存/不恢复优化器 state（非完整 resume）
     optimizer = ZeroRedundancyOptimizer(
-        model.parameters(), optimizer_class=torch.optim.AdamW, lr=args.lr, fused=True
+        model.parameters(),
+        optimizer_class=torch.optim.AdamW,  # 底层仍是 AdamW
+        lr=args.lr,
+        fused=True,  # 融合 CUDA kernel，通常更快
     )
+    # 余弦退火：学习率从 args.lr 平滑降到 eta_min（T_max / eta_min 为示例取值）
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=1000, eta_min=args.lr * 1e-2
     )
 
-    is_experiment = False
-    exp_dir: Path = Path(args.save_dir)
-    if args.experiment_name is not None:
-        is_experiment = True
-        exp_dir = exp_dir / args.experiment_name
+    # 传了 --experiment-name 才开启存盘 / 续训
+    is_experiment, exp_dir = resolve_experiment_dir(args)
 
-    # 尝试恢复训练。
+    # state：训练进度（与权重分开存，方便续训时知道从哪一步接着跑）
     state = {
-        "epoch": 0,
-        "global_step": 0,
-        "epoch_step": 0,
-        "running_loss": 0,
+        "epoch": 0,  # 当前第几轮
+        "global_step": 0,  # 全局已更新多少步（跨 epoch 累计）
+        "epoch_step": 0,  # 本 epoch 内已走到第几步
     }
-    resumed = False
-    if is_experiment and (exp_dir / "state.json").exists():
+    # 两次打日志之间的 loss 累加在 GPU 上，避免每步 .item() 触发同步
+    running_loss = torch.zeros((), device=device, dtype=torch.float32)
 
-        def _load_to_device(p):
-            return torch.load(p, map_location=device, weights_only=True)
-
-        model.load_state_dict(_load_to_device(exp_dir / "model.pt"))
-        lr_scheduler.load_state_dict(_load_to_device(exp_dir / "lr_scheduler.pt"))
-        with open(exp_dir / "state.json") as fp:
-            state = json.load(fp)
-        resumed = True
     if is_experiment:
-        LOGGER.info(f"Resumed={resumed} | {state}")
+        # 恢复模型权重、scheduler 与进度；load_optimizer=False → Adam 动量等会重新初始化
+        state, resumed = resume_if_available(
+            exp_dir,
+            device,
+            model,
+            optimizer,
+            lr_scheduler,
+            state,
+            load_optimizer=False,
+        )
+        # 只让 rank 0 打续训日志，避免刷屏
+        if rank == 0:
+            LOGGER.info(f"Resumed={resumed} | {state}")
+    # 等所有进程读完（或跳过）checkpoint，再一起往下走
     dist.barrier()
 
+    # 只由 rank 0 创建实验目录；前后 barrier 保证「先检查完再创建、创建完再训练」
     if is_experiment and rank == 0:
-        LOGGER.info(f"Creating experiment root directory")
-        exp_dir.mkdir(parents=True, exist_ok=True)
+        ensure_experiment_dir(exp_dir)
     dist.barrier()
 
-    timers = {k: LocalTimer(device) for k in ["data", "forward", "backward", "update"]}
-
+    # 从上次停的 epoch 继续，训到 num_epochs
     for state["epoch"] in range(state["epoch"], args.num_epochs):
         LOGGER.info(f"Begin epoch {state['epoch']} at step {state['epoch_step']}")
 
+        # 每个 epoch 必须 set_epoch，DistributedSampler 的打乱顺序才会随 epoch 变化
+        dataloader.sampler.set_epoch(state["epoch"])
+
+        # 进度条只在 rank 0 显示，避免多进程抢同一终端
         progress_bar = tqdm.tqdm(range(len(dataloader)), disable=rank > 0)
         if state["epoch_step"] > 0:
+            # 断点续训时，进度条先跳到上次停的位置
             progress_bar.update(state["epoch_step"])
 
-        # 每个 epoch 都需要这样做，才能以可复现的方式使用不同的打乱顺序。
-        dataloader.sampler.set_epoch(state["epoch"])
-        batches = iter(dataloader)
-
-        for i_step in range(len(dataloader)):
-            with timers["data"], torch.no_grad():
-                batch = next(batches)
-                batch = {k: v.to(device=device) for k, v in batch.items()}
-
+        for i_step, batch in enumerate(dataloader):
+            # 续训：跳过本 epoch 里已经训过的 step（仍会取 batch，以保持 sampler 顺序一致）
             if i_step < state["epoch_step"]:
-                # 注意：用于恢复训练。
                 continue
 
-            with timers["forward"]:
-                outputs = model(**batch)
-                del batch  # 注意：为反向传播腾出显存。
+            # 异步拷到本进程 GPU（需配合 pin_memory=True）；用到该 batch 时流上仍会等拷完
+            batch = {
+                k: v.to(device=device, non_blocking=True) for k, v in batch.items()
+            }
 
-            with timers["backward"]:
-                outputs.loss.backward()
+            # 前向：算 logits 和 loss（Causal LM 用 labels 算交叉熵）
+            outputs = model(**batch)
+            # 尽早释放输入占用的显存（可选；大批次 / 长序列时有时能挤一点空间）
+            del batch
 
-            with timers["update"]:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+            # 反向：算梯度；DDP 在此处通过 hook 做跨进程梯度归约（平均）
+            outputs.loss.backward()
+
+            # 各进程用已同步的梯度更新本地参数，再推进学习率
+            optimizer.step()
+            lr_scheduler.step()
+            # set_to_none=True：把 .grad 置 None 省显存（PyTorch 2.0+ 默认已是 True）
+            optimizer.zero_grad(set_to_none=True)
 
             state["global_step"] += 1
             state["epoch_step"] += 1
-            state["running_loss"] += outputs.loss.item()
+            # detach：不建图；留在 GPU 上累加，避免每步 .item() 同步
+            running_loss += outputs.loss.detach().float()
             progress_bar.update(1)
 
+            # 每隔 log_freq 步打一次日志（此时才 .item() 同步一次）
             if state["global_step"] % args.log_freq == 0:
-                tok_per_step = world_size * args.batch_size * args.seq_length
-                ms_per_step = sum(t.avg_elapsed_ms() for t in timers.values())
                 info = {
                     "global_step": state["global_step"],
                     "lr": lr_scheduler.get_last_lr()[0],
-                    "running_loss": state["running_loss"] / args.log_freq,
+                    "running_loss": (running_loss / args.log_freq).item(),
                     "epoch": state["epoch"],
                     "epoch_progress": state["epoch_step"] / len(dataloader),
                     "num_batches_remaining": len(dataloader) - i_step,
+                    "world_size": world_size,
                     **get_mem_stats(device),
-                    "tokens_per_s": 1000 * tok_per_step / ms_per_step,
-                    "time/total": ms_per_step,
-                    **{
-                        f"time/{k}": timer.avg_elapsed_ms()
-                        for k, timer in timers.items()
-                    },
                 }
-
                 LOGGER.info(info)
-
+                # 清峰值显存计数（不释放显存），让下一段 peak_* 只反映本窗口
                 torch.cuda.reset_peak_memory_stats(device)
-                state["running_loss"] = 0
-                for t in timers.values():
-                    t.reset()
+                # 清零累加器，下一段 log_freq 步重新统计平均 loss
+                running_loss.zero_()
 
+            # 仅实验模式：每隔 ckpt_freq 步由 rank 0 写断点
             if is_experiment and state["global_step"] % args.ckpt_freq == 0:
                 if rank == 0:
-                    LOGGER.info("Saving checkpoint.")
-                    torch.save(model.state_dict(), exp_dir / "model.pt")
-                    torch.save(lr_scheduler.state_dict(), exp_dir / "lr_scheduler.pt")
-                    with open(exp_dir / "state.json", "w") as fp:
-                        json.dump(state, fp)
+                    # 不写 optimizer.pt：省时间；续训时优化器状态会重初始化（非完整 resume）
+                    save_checkpoint(
+                        exp_dir,
+                        model,
+                        optimizer,
+                        lr_scheduler,
+                        state,
+                        include_optimizer=False,
+                    )
+                # 等 rank 0 写完，其他进程再继续，避免读到半截文件
                 dist.barrier()
 
+        # 本 epoch 结束，下一轮从 step 0 开始
         state["epoch_step"] = 0
 
-
-def _load_and_preprocess_data(args, config):
-    """
-    Function created using code found in
-    https://github.com/huggingface/transformers/blob/v4.45.1/examples/pytorch/language-modeling/run_clm_no_trainer.py
-    """
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-
-    data = datasets.load_dataset(args.dataset_name, args.dataset_subset)
-
-    column_names = data["train"].column_names
-    text_column_name = "text" if "text" in column_names else column_names[0]
-
-    def tokenize_function(examples):
-        return tokenizer(examples[text_column_name])
-
-    tokenized_datasets = data.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=column_names,
-        num_proc=multiprocessing.cpu_count(),
-        load_from_cache_file=True,
-        desc="Running tokenizer on dataset",
-    )
-
-    seq_length = args.seq_length or tokenizer.model_max_length
-    if seq_length > config.max_position_embeddings:
-        seq_length = min(1024, config.max_position_embeddings)
-
-    # 主要的数据处理函数：拼接数据集中的全部文本，并按 seq_length 切分文本块。
-    def group_texts(examples):
-        # 拼接全部文本。
-        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # 总长度超过 seq_length 时，截去不足整块的尾部；正长度不足一块时，当前实现仍保留短块。
-        # 如果模型支持填充，也可以改成填充，而不是丢弃；这部分可以按需要自定义。
-        if total_length > seq_length:
-            total_length = (total_length // seq_length) * seq_length
-        # 按 seq_length 切成块。
-        result = {
-            k: [t[i : i + seq_length] for i in range(0, total_length, seq_length)]
-            for k, t in concatenated_examples.items()
-        }
-        result["labels"] = result["input_ids"].copy()
-        return result
-
-    lm_datasets = tokenized_datasets.map(
-        group_texts,
-        batched=True,
-        num_proc=multiprocessing.cpu_count(),
-        load_from_cache_file=True,
-        desc=f"Grouping texts in chunks of {seq_length}",
-    )
-
-    return lm_datasets["train"]
+    # 释放进程组资源（训练正常结束时显式销毁）
+    dist.destroy_process_group()
 
 
 def get_mem_stats(device=None):
+    """读取当前 GPU 显存占用（已分配 / 峰值 / 预留），单位 GB。"""
     mem = torch.cuda.memory_stats(device)
     props = torch.cuda.get_device_properties(device)
     return {
-        "total_gb": 1e-9 * props.total_memory,
-        "curr_alloc_gb": 1e-9 * mem["allocated_bytes.all.current"],
-        "peak_alloc_gb": 1e-9 * mem["allocated_bytes.all.peak"],
-        "curr_resv_gb": 1e-9 * mem["reserved_bytes.all.current"],
-        "peak_resv_gb": 1e-9 * mem["reserved_bytes.all.peak"],
+        "total_gb": 1e-9 * props.total_memory,  # 卡总显存
+        "curr_alloc_gb": 1e-9 * mem["allocated_bytes.all.current"],  # 当前已分配
+        "peak_alloc_gb": 1e-9 * mem["allocated_bytes.all.peak"],  # 分配峰值
+        "curr_resv_gb": 1e-9 * mem["reserved_bytes.all.current"],  # 当前缓存预留
+        "peak_resv_gb": 1e-9 * mem["reserved_bytes.all.peak"],  # 预留峰值
     }
 
 
-@contextmanager
-def rank0_first():
-    rank = dist.get_rank()
-    if rank == 0:
-        yield
-    dist.barrier()
-    if rank > 0:
-        yield
-    dist.barrier()
-
-
-class LocalTimer:
-    def __init__(self, device: torch.device):
-        if device.type == "cpu":
-            self.synchronize = lambda: torch.cpu.synchronize(device=device)
-        elif device.type == "cuda":
-            self.synchronize = lambda: torch.cuda.synchronize(device=device)
-        self.measurements = []
-        self.start_time = None
-
-    def __enter__(self):
-        self.synchronize()
-        self.start_time = time.time()
-        return self
-
-    def __exit__(self, type, value, traceback):
-        if traceback is None:
-            self.synchronize()
-            end_time = time.time()
-            self.measurements.append(end_time - self.start_time)
-        self.start_time = None
-
-    def avg_elapsed_ms(self):
-        return 1000 * (sum(self.measurements) / len(self.measurements))
-
-    def reset(self):
-        self.measurements = []
-        self.start_time = None
-
-
 def _get_parser() -> argparse.ArgumentParser:
+    """定义命令行参数。"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("-e", "--experiment-name", default=None)
-    parser.add_argument("-d", "--dataset-name", default=None, required=True)
-    parser.add_argument("--dataset-subset", default=None)
-    parser.add_argument("-m", "--model-name", default=None, required=True)
-    parser.add_argument("--save-dir", default="../outputs")
-    parser.add_argument("--seed", default=0, type=int)
-    parser.add_argument("--num-epochs", default=100, type=int)
-    parser.add_argument("--lr", default=3e-5, type=float)
-    parser.add_argument("-b", "--batch-size", default=1, type=int)
-    parser.add_argument("--log-freq", default=10, type=int)
-    parser.add_argument("--ckpt-freq", default=500, type=int)
-    parser.add_argument("-s", "--seq-length", default=1024, type=int)
+    parser.add_argument("-e", "--experiment-name", default=None)  # 实验名；有则开启存盘/续训
+    parser.add_argument("-d", "--dataset-name", default=None, required=True)  # HF 数据集名
+    parser.add_argument("--dataset-subset", default=None)  # 数据集子集（可选）
+    parser.add_argument("-m", "--model-name", default=None, required=True)  # 模型配置/分词器名
+    parser.add_argument("--save-dir", default="../outputs")  # checkpoint 根目录
+    parser.add_argument("--seed", default=0, type=int)  # 随机种子
+    parser.add_argument("--num-epochs", default=100, type=int)  # 训练轮数
+    parser.add_argument("--lr", default=3e-5, type=float)  # 学习率
+    parser.add_argument(
+        "-b", "--batch-size", default=1, type=int
+    )  # 每进程 batch（非全局）
+    parser.add_argument("--log-freq", default=10, type=int)  # 每隔多少 step 打日志
+    parser.add_argument("--ckpt-freq", default=500, type=int)  # 每隔多少 step 存 checkpoint
+    parser.add_argument("-s", "--seq-length", default=1024, type=int)  # 序列长度
     return parser
 
 
+# 直接 python / torchrun … train_llm.py 时才进 main；被 import 时不自动训练
 if __name__ == "__main__":
     main()

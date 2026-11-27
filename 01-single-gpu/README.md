@@ -295,3 +295,5 @@ if is_experiment and state["global_step"] % args.ckpt_freq == 0:
 - 单卡脚本刻意保持简单，作为后续分布式章节的共同起点。
 - 主体流程是：**设备与模型 → 数据 → 优化器 → 训练一步（含日志）**。
 - 代码按职责拆成 `train_llm.py` / `data.py` / `checkpoint.py`，阅读时以 `train_llm.py` 的训练主线为准。
+
+本章的训练由一个 Python 进程控制。一台机器有多张 GPU 时，可以让多个进程各用一张 GPU，用数据并行一起训练。下一章在本章代码上引入 `torchrun` 和 `DistributedDataParallel`，扩展成单节点多 GPU 训练。
