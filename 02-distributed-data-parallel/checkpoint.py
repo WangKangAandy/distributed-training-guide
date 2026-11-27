@@ -1,4 +1,4 @@
-"""实验目录、checkpoint 保存与断点续训。与第 1 章 checkpoint.py 同构；rank0 / barrier 由 train_llm.py 调用。"""
+"""实验目录、checkpoint 保存与断点续训。与第 1 章 checkpoint.py 同构；谁写盘、何时 barrier 由 train_llm.py 决定。"""
 
 import json
 import logging

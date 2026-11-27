@@ -10,7 +10,7 @@
 └── checkpoint.py   # 实验目录、保存与恢复（与第 1 章同构；ZeRO 时由 train_llm 跳过优化器落盘）
 ```
 
-`rank0_first`、barrier、ZeRO 跳过优化器等分布式协调都留在 `train_llm.py`。
+主线假定 config / tokenizer / 数据集已在训练启动前准备好；各进程用 `local_files_only=True` 独立读取。checkpoint 的 rank0 写盘与 barrier、ZeRO 跳过优化器仍留在 `train_llm.py`。
 
 ## 1. 从单卡训练到多 GPU 训练
 
@@ -201,10 +201,16 @@ torch.cuda.set_device(local_rank)
 
 ### <a id="using-distributeddataparallel"></a>使用 DistributedDataParallel
 
+各进程独立读本地 config、在对应 GPU 上建模型，再用 DDP 包装。本章是 `from_config` **从头训练**（随机初始化），不加载预训练权重；SFT / 续训需要另走权重加载路径。
+
 ```diff
 +from torch.nn.parallel import DistributedDataParallel
 
- with device: 
+ with device:
+-    config = AutoConfig.from_pretrained(args.model_name, use_cache=False)
++    config = AutoConfig.from_pretrained(
++        args.model_name, local_files_only=True, use_cache=False
++    )
      model = AutoModelForCausalLM.from_config(config, dtype=dtype)
 
 +model = DistributedDataParallel(model, device_ids=[local_rank])
@@ -267,15 +273,13 @@ def distributed_sampler():
 
 > 在分布式模式下，每个 epoch 开始、创建 DataLoader 迭代器之前必须调用 `set_epoch()`，多个 epoch 之间的打乱才能正常工作。否则会一直使用相同顺序。
 
-### <a id="downloading-model--data-in-rank-0-first"></a>先由 rank 0 下载模型和数据
+### <a id="downloading-model--data-in-rank-0-first"></a>进阶：未预置制品时再用 rank 协调
 
-这主要是因为加载数据时可能下载或预处理数据并写入磁盘。
+`rank0_first()` **不是** DDP 训练的必要步骤。DDP 主线是：绑 GPU → `init_process_group` → 各进程初始化模型 → DDP 包装 → `DistributedSampler` → 反向时同步梯度。
 
-如果不让 rank 0 先做，所有 rank 可能同时下载，整体会变慢。
+真实工程里，模型 config / tokenizer / 数据集通常在**训练任务准备阶段**就放到本地盘、共享存储或对象存储；`torchrun` 启动后各 Worker 只读已有文件。大模型制品可达数十 GB 以上，更不应让每个 Worker 在启动时竞争下载。
 
-**注意：更好的做法是提前把数据下载并预处理到共享网络盘。**
-
-可以用一个简单的上下文管理器：
+本章主线因此使用 `local_files_only=True`，并假定制品已就绪。只有在「任务启动时仍必须往共享缓存里写」的特殊场景，才需要让一个进程先写、其余进程再读，例如：
 
 ```python
 @contextmanager
@@ -289,21 +293,7 @@ def rank0_first():
     dist.barrier()
 ```
 
-下载模型权重和分词器：
-
-```diff
-+with rank0_first():
-     config = AutoConfig.from_pretrained(args.model_name, use_cache=False)
-     with device:
-         model = AutoModelForCausalLM.from_config(config, dtype=dtype)
-```
-
-下载数据：
-
-```diff
-+with rank0_first():
-     train_data = _load_and_preprocess_data(args, tokenizer, config)
-```
+这与 checkpoint 的「仅 rank 0 写盘 + barrier」不同：后者是训练过程中的落盘协调，前者是制品准备缺失时的应急手段。
 
 ### <a id="only-creating-experiment-directory-on-rank-0"></a>只在 rank 0 创建实验目录
 
@@ -373,12 +363,12 @@ DDP 在每张 GPU 上都保存完整模型和优化器。对优化器来说尤�
 
 ## <a id="hf_home---the-downloaded-modeldataset-directory"></a>10. `$HF_HOME`：已下载的模型与数据集目录
 
-Hugging Face 的 `transformers` 和 `datasets` 默认把内容下载到 `$HF_HOME`。`$HF_HOME` 的默认值是**节点本地**目录。这里有两个选择：
+Hugging Face 的 `transformers` 和 `datasets` 默认把内容放到 `$HF_HOME`（默认为**节点本地**目录）。推荐做法仍是：训练启动前把需要的 config、tokenizer、数据集缓存准备好；训练脚本用 `local_files_only=True` 只读。
 
-1. 保持 `$HF_HOME` 为节点本地，并把 `with rank0_first()` 改成 `with local_rank0_first()`。
-2. 把 `$HF_HOME` 改成共享网络盘。
+若暂时无法预置、必须在任务内首次拉取，再按缓存位置选择协调方式（这是进阶路径，不是本章默认）：
 
-第三种选择需要修改本仓库代码，在代码里自动判断：
+1. `$HF_HOME` 在节点本地：每台机器上由 `local_rank == 0` 先拉。
+2. `$HF_HOME` 在共享网络盘：全局由 `rank == 0` 先拉。
 
 ```python
 @contextmanager
@@ -390,22 +380,17 @@ def rank_ordered(first: bool):
         yield
     dist.barrier()
 
-# 判断 HF_HOME 是节点本地目录还是共享目录
 hf_home_is_networked = os.path.ismount(os.environ["HF_HOME"])
-
-if hf_home_is_networked:
-    # 目录共享时只让 rank 0 先执行，下载只发生在 rank 0
-    should_go_first = rank == 0
-else:
-    # 目录是节点本地时，让该节点上的一个进程下载（local rank 0）
-    should_go_first = local_rank == 0
+should_go_first = (rank == 0) if hf_home_is_networked else (local_rank == 0)
 
 with rank_ordered(should_go_first):
-    train_data = _load_and_preprocess_data(args, tokenizer, config)
+    # 仅在「启动时仍要写缓存」时使用；主线代码不走这里
+    train_data = load_and_preprocess_data(args, config)
 ```
 
 ## 11. 本章小结
 
 - 从单卡到多 GPU，训练循环没有换掉，而是变成多个进程各跑一份。
 - `torchrun` 负责启动进程并提供 `RANK` / `LOCAL_RANK` / `WORLD_SIZE`；DDP 在反向时同步梯度；`DistributedSampler` 负责各进程读不同数据。
+- 制品准备与训练启动分层：主线用 `local_files_only=True` 读已有文件；`rank0_first` 只是未预置制品时的应急协调，不是 DDP 必要步骤。
 - 单节点上用 `LOCAL_RANK` 绑定 GPU。多节点启动、会合和容错放到后面的章节。

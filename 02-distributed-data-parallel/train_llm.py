@@ -1,5 +1,4 @@
 import argparse
-from contextlib import contextmanager
 import logging
 import os
 
@@ -53,9 +52,12 @@ def main():
     dtype = torch.bfloat16
     torch.manual_seed(args.seed)
 
-    # 注意：假设 $HF_HOME 是共享存储；rank0_first 避免多进程同时下载/写缓存
-    with rank0_first(), device:
-        config = AutoConfig.from_pretrained(args.model_name, use_cache=False)
+    # 训练阶段只读本地/缓存制品，不负责下载；各进程独立初始化。
+    # from_config：按配置随机初始化（从头训练），不加载预训练权重。
+    with device:
+        config = AutoConfig.from_pretrained(
+            args.model_name, local_files_only=True, use_cache=False
+        )
         model = AutoModelForCausalLM.from_config(config, dtype=dtype)
     LOGGER.info(
         f"Training {sum(p.numel() for p in model.parameters())} model parameters"
@@ -69,8 +71,7 @@ def main():
     )
     LOGGER.info(f"After DDP: model uses {get_mem_stats(device)['curr_alloc_gb']}gb")
 
-    with rank0_first():
-        train_data = load_and_preprocess_data(args, config)
+    train_data = load_and_preprocess_data(args, config)
     LOGGER.debug(f"{len(train_data)} training samples")
 
     dataloader = DataLoader(
@@ -194,18 +195,6 @@ def get_mem_stats(device=None):
         "curr_resv_gb": 1e-9 * mem["reserved_bytes.all.current"],
         "peak_resv_gb": 1e-9 * mem["reserved_bytes.all.peak"],
     }
-
-
-@contextmanager
-def rank0_first():
-    """让 rank 0 先跑完一段逻辑（如下载），再让其余 rank 继续。"""
-    rank = dist.get_rank()
-    if rank == 0:
-        yield
-    dist.barrier()
-    if rank > 0:
-        yield
-    dist.barrier()
 
 
 def _get_parser() -> argparse.ArgumentParser:

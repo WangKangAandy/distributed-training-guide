@@ -1,4 +1,4 @@
-"""数据集加载、分词、切块。与第 1 章 data.py 同构；分布式协调（如 rank0_first）放在 train_llm.py。"""
+"""数据集加载、分词、切块。与第 1 章 data.py 同构；假定 tokenizer / 数据已在本地或缓存中就绪。"""
 
 from itertools import chain
 import multiprocessing
@@ -12,11 +12,17 @@ def load_and_preprocess_data(args, config):
     Function created using code found in
     https://github.com/huggingface/transformers/blob/v4.45.1/examples/pytorch/language-modeling/run_clm_no_trainer.py
     """
-    # 分词器：把文本变成 token id，需与模型词表匹配
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    # 分词器：把文本变成 token id，需与模型词表匹配；训练阶段不下载
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name, local_files_only=True
+    )
 
-    # 从 Hugging Face Hub（或本地）加载数据集；subset 是子集名（有的数据集需要）
-    data = datasets.load_dataset(args.dataset_name, args.dataset_subset)
+    # 从本地缓存加载数据集；subset 是子集名（有的数据集需要）
+    data = datasets.load_dataset(
+        args.dataset_name,
+        args.dataset_subset,
+        download_config=datasets.DownloadConfig(local_files_only=True),
+    )
 
     # 找出文本所在的列名（常见叫 "text"，否则用第一列）
     column_names = data["train"].column_names
