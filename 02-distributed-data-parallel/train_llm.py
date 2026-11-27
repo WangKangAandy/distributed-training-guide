@@ -1,5 +1,6 @@
 import argparse
 import logging
+import multiprocessing
 import os
 
 import torch
@@ -38,7 +39,13 @@ def main():
     world_size = int(os.environ["WORLD_SIZE"])
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
-    dist.init_process_group(rank=rank, world_size=world_size, device_id=device)
+    # NCCL：GPU 分布式通信后端；device_id：当前进程绑定的 GPU
+    dist.init_process_group(
+        backend="nccl",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+    )
 
     logging.basicConfig(
         format=f"[rank={rank}] [%(asctime)s] %(levelname)s:%(message)s",
@@ -54,6 +61,7 @@ def main():
 
     # 训练阶段只读本地/缓存制品，不负责下载；各进程独立初始化。
     # from_config：按配置随机初始化（从头训练），不加载预训练权重。
+    # 本章不引入 torch.compile，避免把编译器优化混入 DDP 入门主线。
     with device:
         config = AutoConfig.from_pretrained(
             args.model_name, local_files_only=True, use_cache=False
@@ -62,8 +70,6 @@ def main():
     LOGGER.info(
         f"Training {sum(p.numel() for p in model.parameters())} model parameters"
     )
-
-    model = torch.compile(model)
     LOGGER.info(f"Initialized model uses {get_mem_stats(device)['curr_alloc_gb']}gb")
 
     model = DistributedDataParallel(
@@ -71,7 +77,9 @@ def main():
     )
     LOGGER.info(f"After DDP: model uses {get_mem_stats(device)['curr_alloc_gb']}gb")
 
-    train_data = load_and_preprocess_data(args, config)
+    # 每个 rank 都会跑 map；按 world_size 均分 CPU，避免 8 进程各开满核
+    num_proc = max(1, multiprocessing.cpu_count() // world_size)
+    train_data = load_and_preprocess_data(args, config, num_proc=num_proc)
     LOGGER.debug(f"{len(train_data)} training samples")
 
     dataloader = DataLoader(
@@ -82,11 +90,12 @@ def main():
         pin_memory=True,
         collate_fn=default_data_collator,
         # DistributedSampler：按进程切分样本；不要再设 shuffle=True
+        # args.batch_size 是每进程 batch；全局 batch ≈ batch_size * world_size
         sampler=DistributedSampler(train_data, shuffle=True, drop_last=True),
     )
     LOGGER.info(f"{len(dataloader)} batches per epoch")
 
-    # ZeRO：切分优化器状态以省显存；保存其 state_dict 很慢，故存盘时跳过优化器
+    # ZeRO：切分优化器状态以省显存；本章不保存/不恢复优化器 state（非完整 resume）
     optimizer = ZeroRedundancyOptimizer(
         model.parameters(), optimizer_class=torch.optim.AdamW, lr=args.lr, fused=True
     )
@@ -104,6 +113,7 @@ def main():
     running_loss = torch.zeros((), device=device, dtype=torch.float32)
 
     if is_experiment:
+        # 恢复模型权重、scheduler 与进度；优化器动量等会重新初始化
         state, resumed = resume_if_available(
             exp_dir,
             device,
@@ -170,7 +180,7 @@ def main():
 
             if is_experiment and state["global_step"] % args.ckpt_freq == 0:
                 if rank == 0:
-                    # ZeRO 优化器 state 很大且保存慢，本章不写 optimizer.pt
+                    # 不写 optimizer.pt：省时间，也意味着续训不是完整 Adam 状态恢复
                     save_checkpoint(
                         exp_dir,
                         model,
@@ -182,6 +192,8 @@ def main():
                 dist.barrier()
 
         state["epoch_step"] = 0
+
+    dist.destroy_process_group()
 
 
 def get_mem_stats(device=None):

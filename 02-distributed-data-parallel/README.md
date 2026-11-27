@@ -1,6 +1,8 @@
 # 单节点多 GPU
 
-本章在[第 1 章](../01-single-gpu)单卡脚本上，改成单节点多 GPU 的数据并行训练。训练循环本身还是前向、反向、更新；变化是由多个进程一起跑这份代码。
+本章目标：从单卡训练扩展到**单节点多 GPU 数据并行**，讲清三件事——`torchrun` 的进程启动、`DistributedDataParallel` 的梯度同步、`DistributedSampler` 的数据分片。
+
+训练循环本身还是前向、反向、更新；变化是由多个进程一起跑这份代码。
 
 脚本同样拆成三份，与第 1 章同构、各自独立（不跨章 import）：
 
@@ -10,7 +12,7 @@
 └── checkpoint.py   # 实验目录、保存与恢复（与第 1 章同构；ZeRO 时由 train_llm 跳过优化器落盘）
 ```
 
-主线假定 config / tokenizer / 数据集已在训练启动前准备好；各进程用 `local_files_only=True` 独立读取。checkpoint 的 rank0 写盘与 barrier、ZeRO 跳过优化器仍留在 `train_llm.py`。
+主线假定 config / tokenizer / **原始数据集文件**已在训练启动前准备好；各进程用 `local_files_only=True` 独立读取（禁止启动时联网下载）。注意：这不等于 tokenization / grouping 已完成——`map` 缓存未命中时，首次启动仍会做预处理；命中后才会跳过。checkpoint 的 rank0 写盘与 barrier、ZeRO 跳过优化器仍留在 `train_llm.py`。
 
 ## 1. 从单卡训练到多 GPU 训练
 
@@ -182,8 +184,16 @@ torch.cuda.set_device(local_rank)
 +   device = torch.device(f"cuda:{local_rank}")
 +   torch.cuda.set_device(device)
 
-+   dist.init_process_group(rank=rank, world_size=world_size, device_id=device)
++   dist.init_process_group(
++       backend="nccl",
++       rank=rank,
++       world_size=world_size,
++       device_id=device,
++   )
 ```
+
+- `backend="nccl"`：GPU 上常用的分布式通信后端。
+- `device_id`：告诉进程组当前进程对应哪张 GPU（需与项目使用的 PyTorch 版本一致；较新版本支持该参数）。
 
 如果不调用 `torch.cuda.set_device`，进程可能不会使用正确的 CUDA 设备。
 
@@ -232,20 +242,17 @@ gradient = fcol.all_reduce(gradient, "sum", self.process_group)
 
 ### <a id="using-distributedsampler"></a>使用 DistributedSampler
 
-普通训练脚本用 `torch.utils.data.DataLoader` 组 batch。DataLoader 的一个参数是 `sampler`，构造 batch 时从数据集中取样。可以把 sampler 理解成：
+每个进程仍持有**完整模型副本**，但不应再各自扫完整数据集。否则等价于把同一批样本算了 `world_size` 遍，全局有效 batch 和优化轨迹都会乱掉。
 
-```python
-def simple_sampler():
-    worker_len = len(dataset)
-    return random.choice(range(worker_len))
-```
+`DistributedSampler` 并不把数据集物理切成多份文件，而是为每个进程生成**不同的样本索引**。以 1 000 条样本、4 张 GPU 为例（示意，实际还会 shuffle / drop_last）：
 
-DistributedSampler 的巧妙之处是按 worker 数量划分数据集长度。它甚至不需要真正切分数据集，只是从数据集的一个特定子集中选择要返回的整数：
+```text
+原始数据集索引：0 … 999
 
-```python
-def distributed_sampler():
-    worker_len = len(dataset) // dist.get_world_size()
-    return dist.get_rank() * worker_len + random.choice(range(worker_len))
+Rank 0 → 约 0–249
+Rank 1 → 约 250–499
+Rank 2 → 约 500–749
+Rank 3 → 约 750–999
 ```
 
 让它生效的代码改动非常少：
@@ -255,13 +262,23 @@ def distributed_sampler():
 
  dataloader = DataLoader(
      train_data,
-     batch_size=args.batch_size,
+     batch_size=args.batch_size,  # 每进程 batch size
 -    shuffle=True,
 -    drop_last=True,
      collate_fn=default_data_collator,
 +    sampler=DistributedSampler(train_data, shuffle=True, drop_last=True),
  )
 ```
+
+#### 全局 Batch Size
+
+`--batch-size` / `args.batch_size` 是**每个进程**一次前向看到的样本数，不是整个任务的全局 batch。
+
+```text
+Global Batch Size ≈ per_device_batch × world_size × grad_accum_steps
+```
+
+例如 8 GPU、每卡 batch 4、梯度累积 2 步：`8 × 4 × 2 = 64`。增加 GPU 数而不改每卡 batch 时，全局 batch 会跟着变大；调学习率或对比实验时要意识到这一点。本章示例未做梯度累积，因此全局 batch ≈ `batch_size × world_size`。
 
 还要调用 [DistributedSampler.set_epoch](https://pytorch.org/docs/stable/data.html#torch.utils.data.distributed.DistributedSampler)。PyTorch 文档的说明是：
 
@@ -272,6 +289,12 @@ def distributed_sampler():
 ```
 
 > 在分布式模式下，每个 epoch 开始、创建 DataLoader 迭代器之前必须调用 `set_epoch()`，多个 epoch 之间的打乱才能正常工作。否则会一直使用相同顺序。
+
+### 数据预处理仍可能发生在首次启动
+
+`local_files_only=True` 只保证不联网下载缺失文件；`load_from_cache_file=True` 只在 **map 缓存已存在** 时跳过 tokenization / grouping。缓存未命中时，每个 rank 仍会执行 `data.map(...)`。
+
+另外，多进程同时把 `num_proc` 设成整机 CPU 核数会过度订阅。本章按 `cpu_count() // world_size` 限制每个 rank 的 map 并行度。更稳妥的工程做法是把 Tokenization / Packing 做成独立的数据准备阶段，训练启动只读已处理好的样本。
 
 ### <a id="downloading-model--data-in-rank-0-first"></a>进阶：未预置制品时再用 rank 协调
 
@@ -314,11 +337,7 @@ def rank0_first():
 ```diff
  if state["global_step"] % args.ckpt_freq == 0:
 +    if rank == 0:
-         torch.save(optimizer.state_dict(), exp_dir / "optimizer.pt")
-         torch.save(model.state_dict(), exp_dir / "model.pt")
-         torch.save(lr_scheduler.state_dict(), exp_dir / "lr_scheduler.pt")
-         with open(exp_dir / "state.json", "w") as fp:
-              json.dump(state, fp)
+         save_checkpoint(..., include_optimizer=False)
 +    dist.barrier()
 ```
 
@@ -335,7 +354,7 @@ DDP 在每张 GPU 上都保存完整模型和优化器。对优化器来说尤�
 +)
 ```
 
-可惜保存 ZeRO 状态字典的代码极其慢，所以还要去掉优化器状态字典的保存。
+保存 ZeRO 的优化器 state 很慢，本章因此 **`include_optimizer=False` / `load_optimizer=False`**：会恢复模型权重、学习率调度器与训练进度，但 **AdamW 的动量等优化器状态会重新初始化**。这不是严格意义上的完整断点续训，后续轨迹可能与从未中断的训练不同。若需要完整 ZeRO resume，应使用专门的分布式 checkpoint 机制（聚合优化器分片后再保存），而不是简单跳过。
 
 ## <a id="how-multi-node-works"></a>7. 多节点如何工作
 
@@ -363,34 +382,29 @@ DDP 在每张 GPU 上都保存完整模型和优化器。对优化器来说尤�
 
 ## <a id="hf_home---the-downloaded-modeldataset-directory"></a>10. `$HF_HOME`：已下载的模型与数据集目录
 
-Hugging Face 的 `transformers` 和 `datasets` 默认把内容放到 `$HF_HOME`（默认为**节点本地**目录）。推荐做法仍是：训练启动前把需要的 config、tokenizer、数据集缓存准备好；训练脚本用 `local_files_only=True` 只读。
+Hugging Face 的 `transformers` 和 `datasets` 默认把内容放到 `$HF_HOME`（默认为**节点本地**目录）。推荐做法仍是：训练启动前把需要的 config、tokenizer、数据集准备好；训练脚本用 `local_files_only=True` 只读。
 
-若暂时无法预置、必须在任务内首次拉取，再按缓存位置选择协调方式（这是进阶路径，不是本章默认）：
-
-1. `$HF_HOME` 在节点本地：每台机器上由 `local_rank == 0` 先拉。
-2. `$HF_HOME` 在共享网络盘：全局由 `rank == 0` 先拉。
+若暂时无法预置、必须在任务内首次写入缓存，由**部署配置**声明缓存是否跨节点共享，再决定谁先写（不要用 `os.path.ismount` 去猜网络盘）：
 
 ```python
-@contextmanager
-def rank_ordered(first: bool):
-    if first:
-        yield
-    dist.barrier()
-    if not first:
-        yield
-    dist.barrier()
+# 由训练任务 / 集群配置明确指定，而不是运行时探测文件系统
+shared_cache = args.shared_cache  # True：跨节点共享缓存；False：每节点本地缓存
+should_go_first = (rank == 0) if shared_cache else (local_rank == 0)
 
-hf_home_is_networked = os.path.ismount(os.environ["HF_HOME"])
-should_go_first = (rank == 0) if hf_home_is_networked else (local_rank == 0)
-
-with rank_ordered(should_go_first):
-    # 仅在「启动时仍要写缓存」时使用；主线代码不走这里
+# 与上文 rank0_first 相同：先让 should_go_first 的进程跑完，再放行其余进程
+if should_go_first:
     train_data = load_and_preprocess_data(args, config)
+dist.barrier()
+if not should_go_first:
+    train_data = load_and_preprocess_data(args, config)
+dist.barrier()
 ```
 
 ## 11. 本章小结
 
-- 从单卡到多 GPU，训练循环没有换掉，而是变成多个进程各跑一份。
-- `torchrun` 负责启动进程并提供 `RANK` / `LOCAL_RANK` / `WORLD_SIZE`；DDP 在反向时同步梯度；`DistributedSampler` 负责各进程读不同数据。
-- 制品准备与训练启动分层：主线用 `local_files_only=True` 读已有文件；`rank0_first` 只是未预置制品时的应急协调，不是 DDP 必要步骤。
+- 本章定位：单节点多 GPU 数据并行——讲透 `torchrun`、DDP、`DistributedSampler` 三件事。
+- `torchrun` 启动进程并提供 `RANK` / `LOCAL_RANK` / `WORLD_SIZE`；DDP 在反向时同步梯度；`DistributedSampler` 按索引分片，每卡仍有完整模型副本。
+- `--batch-size` 是每进程 batch；全局 batch ≈ `batch_size × world_size`（再乘梯度累积步数，若有）。
+- 制品准备与训练启动分层：`local_files_only` 禁止启动时下载；tokenization 缓存未命中时仍可能在首次启动执行 `map`。
+- 本章 ZeRO checkpoint 恢复权重与进度，但不恢复优化器状态，不是完整 resume。
 - 单节点上用 `LOCAL_RANK` 绑定 GPU。多节点启动、会合和容错放到后面的章节。

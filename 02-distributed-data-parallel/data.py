@@ -1,4 +1,4 @@
-"""数据集加载、分词、切块。与第 1 章 data.py 同构；假定 tokenizer / 数据已在本地或缓存中就绪。"""
+"""数据集加载、分词、切块。与第 1 章 data.py 同构；假定 tokenizer / 原始数据已在本地就绪。"""
 
 from itertools import chain
 import multiprocessing
@@ -7,11 +7,18 @@ import datasets
 from transformers import AutoTokenizer
 
 
-def load_and_preprocess_data(args, config):
+def load_and_preprocess_data(args, config, *, num_proc=None):
     """
     Function created using code found in
     https://github.com/huggingface/transformers/blob/v4.45.1/examples/pytorch/language-modeling/run_clm_no_trainer.py
+
+    local_files_only：不从网络下载缺失文件。
+    load_from_cache_file：若 tokenization / grouping 缓存已存在则复用；
+    缓存不存在时，仍会在本次启动中执行 map（不是「数据已完全预处理好」）。
     """
+    if num_proc is None:
+        num_proc = max(1, multiprocessing.cpu_count())
+
     # 分词器：把文本变成 token id，需与模型词表匹配；训练阶段不下载
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name, local_files_only=True
@@ -37,7 +44,7 @@ def load_and_preprocess_data(args, config):
         tokenize_function,
         batched=True,
         remove_columns=column_names,
-        num_proc=multiprocessing.cpu_count(),  # 开多个进程并行跑分词，进程数设为 CPU 核数
+        num_proc=num_proc,
         load_from_cache_file=True,  # 有缓存则直接读，避免重复分词
         desc="Running tokenizer on dataset",
     )
@@ -70,7 +77,7 @@ def load_and_preprocess_data(args, config):
     lm_datasets = tokenized_datasets.map(
         group_texts,
         batched=True,
-        num_proc=multiprocessing.cpu_count(),
+        num_proc=num_proc,
         load_from_cache_file=True,
         desc=f"Grouping texts in chunks of {seq_length}",
     )
