@@ -33,9 +33,10 @@ def main():
     parser = _get_parser()
     args = parser.parse_args()
 
-    rank = int(os.getenv("RANK", "0"))
-    local_rank = rank % torch.cuda.device_count()
-    world_size = int(os.getenv("WORLD_SIZE", "1"))
+    # torchrun 注入：RANK 全局编号，LOCAL_RANK 本机编号（用来绑 GPU），WORLD_SIZE 进程总数
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(rank=rank, world_size=world_size, device_id=device)

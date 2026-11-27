@@ -1,15 +1,107 @@
 # 单节点多 GPU
 
-**注意：本章代码基于[第 1 章](../01-single-gpu)。**
+本章在[第 1 章](../01-single-gpu)单卡脚本上，改成单节点多 GPU 的数据并行训练。训练循环本身还是前向、反向、更新；变化是由多个进程一起跑这份代码。
 
-单节点命令：
+## 1. 从单卡训练到多 GPU 训练
+
+上一章用一个 Python 进程和一张 GPU 完成训练：读 batch、前向、算梯度、更新参数。
+
+模型变大、或希望缩短训练时间时，可以用多张 GPU 同时算。本章采用的 DDP（DistributedDataParallel）方式是：**每张 GPU 一个进程**，而不是一个进程同时去调多张卡。
+
+以一台 4 卡机器为例：
+
+| | 单卡训练 | 单节点多 GPU（DDP） |
+|---|---|---|
+| 进程 | 1 个 | 4 个 |
+| GPU | 1 张 | 每个进程 1 张 |
+| 数据 | 一个进程看完整数据流 | 各进程看不同样本 |
+| 梯度 | 只在本进程里算 | 反向时在进程间同步 |
+
+每个进程持有一份完整模型副本，独立做前向和反向。要让副本保持一致，需要同时满足：
+
+1. 模型和优化器都能放进每张 GPU。
+2. 各进程用同样的方式初始化模型。
+3. 各进程用同样的优化器设置。
+4. 更新前，大家用的是同一份（已同步的）梯度。
+
+训练一步仍然是：
+
+```python
+outputs = model(**batch)  # 前向
+outputs.loss.backward()   # 反向；DDP 在这里同步梯度
+optimizer.step()          # 各进程用同步后的梯度更新本地参数
+lr_scheduler.step()
+optimizer.zero_grad(set_to_none=True)
+```
+
+`backward()` 时，DDP 通过 autograd hook 做梯度归约（先按进程数平均，再求和），并尽量让通信和反向计算重叠。`optimizer.step()` 并不负责发起这次同步，它只用已经同步好的梯度。依据见 [PyTorch DDP 设计说明](https://docs.pytorch.org/docs/stable/notes/ddp.html)。
+
+<img width="800" alt="DDP 一步训练" src="https://github.com/user-attachments/assets/a988f513-a5b3-4e5f-bf0d-019e796ee4e0" />
+
+图里的同步发生在参数更新之前。
+
+于是要分开解决两件事：
+
+- 谁来启动多个进程，并告诉每个进程自己的编号？→ `torchrun`
+- 谁在训练时同步梯度、谁切分数据？→ DDP 与 `DistributedSampler`
+
+三者不能互相替代。`torchrun` 不会自动把单卡脚本变成 DDP。
+
+## 2. torchrun 是什么
+
+`torchrun` 是 PyTorch 自带的分布式启动器（launcher），等价于：
+
+```bash
+python -m torch.distributed.run
+```
+
+它按配置拉起多个训练进程，并写入分布式环境变量。它不做前向、反向，也不做梯度同步。
+
+GPU 训练里常见的对应关系是一个进程一张卡：
+
+```text
+torchrun
+  ├── Worker 0 ── GPU 0
+  ├── Worker 1 ── GPU 1
+  ├── Worker 2 ── GPU 2
+  └── Worker 3 ── GPU 3
+```
+
+这些 Worker 跑同一份 `train_llm.py`。进程编号不同，所以绑定的 GPU 不同、读到的数据也不同。
+
+## 3. 使用 torchrun 启动多 GPU 训练
+
+单卡是直接起一个进程：
+
+```bash
+python train_llm.py
+```
+
+4 张 GPU 时，用 `torchrun` 起 4 个进程：
+
+```bash
+torchrun \
+    --standalone \
+    --nproc-per-node=4 \
+    train_llm.py
+```
+
+- `torchrun`：启动器。
+- `--standalone`：单节点，自动配好本机 rendezvous（进程互相发现的会合点）。多节点的会合方式见[任务启动器](../03-job-launchers/)。
+- `--nproc-per-node=4`：本机启动 4 个进程。单节点时通常等于 GPU 数。写成 `gpu` 表示用上当前机器全部 GPU。
+- `train_llm.py`：每个进程执行的脚本。
+
+只换成 `torchrun` 还不够。脚本里仍要初始化进程组、绑定 GPU、用 DDP 包模型，并用 `DistributedSampler` 分数据。
+
+本章实际命令还会带上数据集、日志和调试相关设置：
 
 ```bash
 cd distributed-training-guide/02-distributed-data-parallel
 export TORCHELASTIC_ERROR_FILE=../error.json
 export OMP_NUM_THREADS=1
 torchrun \
-    --nproc-per-node gpu \
+    --standalone \
+    --nproc-per-node=gpu \
     --redirects 3 \
     --log-dir ../logs \
     train_llm.py \
@@ -17,112 +109,47 @@ torchrun \
     -m openai-community/gpt2
 ```
 
-多节点请看[任务启动器一章](../03-job-launchers/)。
+- `--redirects 3`：把标准输出和标准错误重定向到文件。
+- `--log-dir ../logs`：日志目录。
+- `TORCHELASTIC_ERROR_FILE`：某个 worker 出错时，把错误写到这个文件。脚本里的 `main` 需要 `@record`（来自 `torch.distributed.elastic.multiprocessing.errors`）才会记下完整堆栈。
+- `OMP_NUM_THREADS`：多进程时每个进程默认都想占满 CPU。按「CPU 核数 / GPU 数」设一个上限，避免互相抢核。例如 32 核、8 卡，可以设为 4。上面示例用 `1` 是为了先排除 CPU 过度订阅。
 
-快速跳转：
-- [分布式训练如何工作](#how-distributed-training-works)
-- [使用 torchrun](#using-torchrun-instead-of-python)
-- [代码改动](#code-changes)
-    - [调用 dist.init_process_group() 和 torch.cuda.set_device()](#calling-distinit_process_group-and-torchcudaset_device)
-    - [在日志中包含 rank](#including-rank-in-logging-statements)
-    - [DistributedDataParallel（DDP）](#using-distributeddataparallel)
-    - [DistributedSampler](#using-distributedsampler)
-    - 与 I/O 相关的保护
-        - [先由 rank 0 下载模型和数据](#downloading-model--data-in-rank-0-first)
-        - [只在 rank 0 操作文件系统](#only-creating-experiment-directory-on-rank-0)
-        - [只由 rank 0 保存检查点](#save-checkpoint-on-rank-0)
-- [优化显存：Zero Redundancy](#optimizing-memory---zero-redundancy-optimizer)
-- [多节点如何工作](#how-multi-node-works)
-- [共享存储：在节点之间管理 Python 虚拟环境](#shared-storage---managing-your-python-virtual-environment-across-nodes)
-- [共享存储：在节点之间管理数据集和模型检查点](#shared-storage---mangaging-your-datasetmodel-checkpoints-across-nodes)
-- [`$HF_HOME`：已下载的模型与数据集目录](#hf_home---the-downloaded-modeldataset-directory)
+弹性训练（进程挂了再拉起、节点动态加入）以及 rendezvous 后端的细项，本章不展开。多节点启动见第 3 章，弹性相关见 [elastic-training](../related-topics/elastic-training/README.md)。
 
-## 术语
+## 4. torchrun 启动后发生了什么
 
-- `world size`：参与训练的 GPU 总数。
-- `rank`：这个 worker 的全局唯一编号，范围是 `0` 到 `world_size - 1`（含两端）。
-- `local_rank`：这台机器内部的编号，范围是 `0` 到 `torch.cuda.device_count() - 1`（含两端）。
+执行 `torchrun --standalone --nproc-per-node=4 train_llm.py` 后，会有 4 个进程各自跑一遍脚本，并带上这些环境变量：
 
-## <a id="how-distributed-training-works"></a>分布式训练如何工作
+| 环境变量 | 含义 | 单节点 4 GPU |
+|---|---|---|
+| `LOCAL_RANK` | 本节点内的编号，用来选 GPU | 0、1、2、3 |
+| `RANK` | 整个任务里的全局编号 | 0、1、2、3 |
+| `WORLD_SIZE` | 进程总数 | 4 |
 
-在讲分布式训练需要改什么之前，先想一下原理。做过并行计算的话就会知道，一种并行方式是把工作量分到所有核心上。当每份待处理任务大体相同时，这非常有效。Python 的 `multiprocessing.Pool.map` 就是这样做的。
+单节点上 `LOCAL_RANK` 和 `RANK` 通常相同。多节点上就不一样了：`LOCAL_RANK` 仍是本机 0 起编，`RANK` 在全局连续编号。两台机器、每台 4 进程时：
 
-GPU 上的分布式训练其实一样：我们把工作量（数据集中的 batch）分到多张 GPU。但还多一个问题：如何保证所有 GPU 上的模型相同？
+```text
+Node 0                    Node 1
+LOCAL_RANK=0  RANK=0      LOCAL_RANK=0  RANK=4
+LOCAL_RANK=1  RANK=1      LOCAL_RANK=1  RANK=5
+LOCAL_RANK=2  RANK=2      LOCAL_RANK=2  RANK=6
+LOCAL_RANK=3  RANK=3      LOCAL_RANK=3  RANK=7
+WORLD_SIZE = 8
+```
 
-可以用一种很巧妙的方式做到。为了简化，假设：
-
-1. 模型和优化器都能完整放进每张 GPU。
-2. 所有 GPU 上的模型初始化方式完全相同。
-3. 所有 GPU 上的优化器设置完全相同。
-
-现在看训练循环。PyTorch 中典型写法是：
+脚本用 `LOCAL_RANK` 绑定 GPU，不要用 `RANK % 卡数` 去猜（多节点时会绑错）：
 
 ```python
-outputs = model(**batch) # 1. 前向计算
-optimizer.zero_grad()    # 2. 清空梯度
-outputs.loss.backward()  # 3. 计算梯度，DDP hooks 触发梯度归约
-optimizer.step()         # 4. 各 rank 使用同步后的梯度更新权重
+import os
+import torch
+
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
 ```
 
-`backward()` 在各训练进程中计算梯度，DDP 通过 autograd hooks 发起梯度归约，并尽可能让通信与反向计算重叠。随后，各 rank 的 `optimizer.step()` 使用已同步的梯度在本地更新参数。
+绑好设备之后，再 `init_process_group`，并用 DDP 包装模型。
 
-> 译注：原文将梯度同步归因于 `optimizer.step()`，这里依据 [PyTorch DDP 设计说明](https://docs.pytorch.org/docs/stable/notes/ddp.html)予以纠正。示例也按本仓库 Transformers 模型的返回值使用 `outputs.loss`。
-
-下面是使用这种数据并行时，一个训练步骤的高层示意图：
-
-<img width="800" alt="image" src="https://github.com/user-attachments/assets/a988f513-a5b3-4e5f-bf0d-019e796ee4e0" />
-
-明确地说：**默认 DDP 的梯度同步发生在反向传播过程中，而不是由 `optimizer.step()` 发起**。图中的同步应理解为发生在参数更新之前。
-
-PyTorch 如何实现这一点？
-
-1. [用 torchrun 运行训练脚本的 N 个副本。](#using-torchrun-instead-of-python)
-2. [用 DistributedSampler 在 worker 之间切分数据。](#using-distributedsampler)
-3. [用 DistributedDataParallel 同步梯度。](#using-distributeddataparallel)
-
-## <a id="using-torchrun-instead-of-python"></a>用 `torchrun` 代替 `python`
-
-用 `torchrun` 启动分布式训练时，它会**启动 N 个独立进程**（N 是 `--nproc-per-node` 指定的 GPU 数量），每个进程都运行同一份训练脚本：
-
-```
-> torchrun --nproc-per-node 3 train_llm.py ...
-Launches subproc `$RANK=0 $WORLD_SIZE=3 train_llm.py ...`
-Launches subproc `$RANK=1 $WORLD_SIZE=3 train_llm.py ...`
-Launches subproc `$RANK=2 $WORLD_SIZE=3 train_llm.py ...`
-```
-
-它还会在进程之间建立同步。之后每个进程都运行相同的训练代码，并需要在若干位置同步。每个进程获得一个编号（`rank`），用来决定使用哪张设备。
-
-在多节点上运行时，每台机器都要运行 `torchrun`，除此之外完全相同。具体做法见[任务启动器一章](../03-job-launchers/)。
-
-本指南常用的 `torchrun` 命令行参数：
-
-- `--standalone`：只在单节点运行时使用。
-- `--nnodes`：使用的节点数。这里是 1；进入多节点后会大于 1。
-- `--nproc-per-node`：进程数。`gpu` 表示使用全部可用 GPU。
-- `--redirects 3`：把标准输出和标准错误重定向到文件。
-- `--log-dir ../logs`：设置日志目录。
-
-#### TORCHELASTIC_ERROR_FILE
-
-**调试时一定要设置它！**
-
-某个 worker（包括 worker 进程中的线程）出错时，`torchrun` 会把错误保存到这个环境变量指定的文件。
-
-还要给 `main` 函数加上 `@record`（从 `torch.distributed.elastic.multiprocessing.errors` 导入 `record`）：
-
-```diff
-+@record
- def main():
-```
-
-#### OMP_NUM_THREADS
-
-即使计算发生在 GPU 上，PyTorch 默认也会尽量使用所有可用 CPU 核心。现在有多个进程在运行 PyTorch，如果不把 `OMP_NUM_THREADS` 改成其他值，每个进程都会试图占用全部核心。
-
-可以先查看可用核心数，再按进程分配。例如机器有 32 个核心、8 张 GPU，就可以把 `OMP_NUM_THREADS` 设为 4。
-
-## <a id="code-changes"></a>代码改动
+## 5. 使用 DDP 改造训练代码
 
 ### <a id="calling-distinit_process_group-and-torchcudaset_device"></a>调用 `dist.init_process_group()` 和 `torch.cuda.set_device()`
 
@@ -137,9 +164,9 @@ Launches subproc `$RANK=2 $WORLD_SIZE=3 train_llm.py ...`
      parser = _get_parser()
      args = parser.parse_args()
 
-+   rank = int(os.getenv("RANK", "0"))
-+   local_rank = rank % torch.cuda.device_count()
-+   world_size = int(os.getenv("WORLD_SIZE", "1"))
++   rank = int(os.environ["RANK"])
++   local_rank = int(os.environ["LOCAL_RANK"])
++   world_size = int(os.environ["WORLD_SIZE"])
 
 -   device = torch.device(f"cuda") 
 +   device = torch.device(f"cuda:{local_rank}")
@@ -295,7 +322,7 @@ def rank0_first():
 +    dist.barrier()
 ```
 
-## <a id="optimizing-memory---zero-redundancy-optimizer"></a>优化显存：Zero Redundancy Optimizer
+## <a id="optimizing-memory---zero-redundancy-optimizer"></a>6. 优化显存：Zero Redundancy Optimizer
 
 DDP 在每张 GPU 上都保存完整模型和优化器。对优化器来说尤其浪费。好在可以直接加入 [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054) 来降低显存占用：
 
@@ -310,7 +337,7 @@ DDP 在每张 GPU 上都保存完整模型和优化器。对优化器来说尤�
 
 可惜保存 ZeRO 状态字典的代码极其慢，所以还要去掉优化器状态字典的保存。
 
-## <a id="how-multi-node-works"></a>多节点如何工作
+## <a id="how-multi-node-works"></a>7. 多节点如何工作
 
 它和单节点多 GPU 的工作方式基本相同。单节点时已经有多个进程，多节点只是把额外进程放到不同机器上。
 
@@ -322,19 +349,19 @@ DDP 在每张 GPU 上都保存完整模型和优化器。对优化器来说尤�
 
 超过一个节点后，错误报告和处理变得极其重要。网络问题很常见，还必须保证机器之间的一些细微配置完全一致。
 
-## <a id="shared-storage---managing-your-python-virtual-environment-across-nodes"></a>共享存储：在节点之间管理 Python 虚拟环境
+## <a id="shared-storage---managing-your-python-virtual-environment-across-nodes"></a>8. 共享存储：在节点之间管理 Python 虚拟环境
 
 最简单的方法是把 Python 虚拟环境创建在所有节点都能访问的共享网络盘上。这样所有节点使用完全相同的 Python 可执行文件和环境。
 
 创建方式和普通虚拟环境一样，只是目录必须共享。
 
-## <a id="shared-storage---mangaging-your-datasetmodel-checkpoints-across-nodes"></a>共享存储：在节点之间管理数据集和模型检查点
+## <a id="shared-storage---mangaging-your-datasetmodel-checkpoints-across-nodes"></a>9. 共享存储：在节点之间管理数据集和模型检查点
 
 同样，最简单的方法是把数据放在共享网络盘。需要注意，共享网络盘的读取通常比节点本地盘慢。如果数据加载变慢，可以把数据或模型复制到节点本地存储。
 
 使用 `transformers` 或 `datasets` 时，设置 `$HF_HOME` 来控制 Hugging Face 下载数据集和模型权重的位置。
 
-## <a id="hf_home---the-downloaded-modeldataset-directory"></a>`$HF_HOME`：已下载的模型与数据集目录
+## <a id="hf_home---the-downloaded-modeldataset-directory"></a>10. `$HF_HOME`：已下载的模型与数据集目录
 
 Hugging Face 的 `transformers` 和 `datasets` 默认把内容下载到 `$HF_HOME`。`$HF_HOME` 的默认值是**节点本地**目录。这里有两个选择：
 
@@ -366,3 +393,9 @@ else:
 with rank_ordered(should_go_first):
     train_data = _load_and_preprocess_data(args, tokenizer, config)
 ```
+
+## 11. 本章小结
+
+- 从单卡到多 GPU，训练循环没有换掉，而是变成多个进程各跑一份。
+- `torchrun` 负责启动进程并提供 `RANK` / `LOCAL_RANK` / `WORLD_SIZE`；DDP 在反向时同步梯度；`DistributedSampler` 负责各进程读不同数据。
+- 单节点上用 `LOCAL_RANK` 绑定 GPU。多节点启动、会合和容错放到后面的章节。
